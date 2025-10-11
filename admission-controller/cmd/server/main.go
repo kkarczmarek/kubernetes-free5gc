@@ -65,6 +65,13 @@ func serve(f admitFunc) http.HandlerFunc {
 	}
 }
 
+func toError(err error) *admissionv1.AdmissionResponse {
+    return &admissionv1.AdmissionResponse{
+        Allowed: false,
+        Result:  &metav1.Status{Message: err.Error()},
+    }
+}
+
 func admitMutate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 	req := ar.Request
 	if req == nil {
