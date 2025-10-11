@@ -43,7 +43,7 @@ jobs:
           file: ./admission-controller/Dockerfile
           push: true
           tags: |
-            ghcr.io/kkarczmarek/admission-webhook:0.1.0
+            ghcr.io/kkarczmarek/admission-webhook:0.1.1
             ghcr.io/kkarczmarek/admission-webhook:${{ github.sha }}
           platforms: linux/amd64
           provenance: false
