@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	requiredNS       = "free5gc" // zmieniasz tu, jeśli używasz innego ns
+	requiredNS       = "free5gc"
 	labelPartOfKey   = "app.kubernetes.io/part-of"
 	labelProjectKey  = "project"
 	labelPartOfValue = "free5gc"
@@ -33,19 +33,15 @@ func main() {
 
 	server := &http.Server{Addr: ":8443"}
 
-	// TLS jeżeli są certy
 	if _, err := os.Stat(cert); err == nil {
 		cfg := &tls.Config{}
 		pair, err := tls.LoadX509KeyPair(cert, key)
-		if err != nil {
-			log.Fatalf("load key pair: %v", err)
-		}
+		if err != nil { log.Fatalf("load key pair: %v", err) }
 		cfg.Certificates = []tls.Certificate{pair}
 		server.TLSConfig = cfg
 		log.Printf("listening on https://0.0.0.0:8443")
 		log.Fatal(server.ListenAndServeTLS("", ""))
 	} else {
-		// tryb developerski (HTTP)
 		log.Printf("TLS cert not found, serving HTTP (dev only) on :8080")
 		server.Addr = ":8080"
 		log.Fatal(server.ListenAndServe())
@@ -62,40 +58,27 @@ func serve(f admitFunc) http.HandlerFunc {
 		}
 		resp := f(review)
 		out := admissionv1.AdmissionReview{TypeMeta: review.TypeMeta, Response: resp}
-		if review.Request != nil {
-			out.Response.UID = review.Request.UID
-		}
+		if review.Request != nil { out.Response.UID = review.Request.UID }
 		writeReview(w, &out)
 	}
 }
 
 func admitMutate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 	req := ar.Request
-	if req == nil {
-		return allow("no request")
-	}
-	if req.Namespace != requiredNS {
-		return allow("outside target namespace")
-	}
+	if req == nil { return allow("no request") }
+	if req.Namespace != requiredNS { return allow("outside target namespace") }
 
 	switch req.Kind.Kind {
 	case "Deployment":
 		var obj appsv1.Deployment
-		if err := json.Unmarshal(req.Object.Raw, &obj); err != nil {
-			return toError(err)
-		}
+		if err := json.Unmarshal(req.Object.Raw, &obj); err != nil { return toError(err) }
 		patchOps := ensureLabels(obj.ObjectMeta)
 		return patchResponse(patchOps)
 
 	case "Service", "ConfigMap", "Secret":
-		// wyciągnij same metadata
-		type metaWrapper struct {
-			Metadata metav1.ObjectMeta `json:"metadata"`
-		}
+		type metaWrapper struct{ Metadata metav1.ObjectMeta `json:"metadata"` }
 		var w metaWrapper
-		if err := json.Unmarshal(req.Object.Raw, &w); err != nil {
-			return toError(err)
-		}
+		if err := json.Unmarshal(req.Object.Raw, &w); err != nil { return toError(err) }
 		patchOps := ensureLabels(w.Metadata)
 		return patchResponse(patchOps)
 
@@ -106,23 +89,16 @@ func admitMutate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse 
 
 func admitValidate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 	req := ar.Request
-	if req == nil {
-		return allow("no request")
-	}
-	if req.Namespace != requiredNS {
-		return deny(fmt.Sprintf("resources must be created in namespace %s", requiredNS))
-	}
+	if req == nil { return allow("no request") }
+	if req.Namespace != requiredNS { return deny(fmt.Sprintf("resources must be created in namespace %s", requiredNS)) }
 
 	switch req.Kind.Kind {
 	case "Deployment":
 		var obj appsv1.Deployment
-		if err := json.Unmarshal(req.Object.Raw, &obj); err != nil {
-			return toError(err)
-		}
+		if err := json.Unmarshal(req.Object.Raw, &obj); err != nil { return toError(err) }
 		if !hasRequiredLabels(obj.ObjectMeta.Labels) {
 			return deny("missing required labels: app.kubernetes.io/part-of=free5gc and project=free5gc")
 		}
-		// minimalne sprawdzenie zasobów/privileged
 		for _, c := range obj.Spec.Template.Spec.Containers {
 			if c.Resources.Requests == nil || c.Resources.Limits == nil {
 				return deny("all containers must define resources.requests and resources.limits")
@@ -134,16 +110,10 @@ func admitValidate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionRespons
 		return allow("ok")
 
 	case "Service", "ConfigMap", "Secret":
-		type metaWrapper struct {
-			Metadata metav1.ObjectMeta `json:"metadata"`
-		}
+		type metaWrapper struct{ Metadata metav1.ObjectMeta `json:"metadata"` }
 		var w metaWrapper
-		if err := json.Unmarshal(req.Object.Raw, &w); err != nil {
-			return toError(err)
-		}
-		if !hasRequiredLabels(w.Metadata.Labels) {
-			return deny("missing required labels")
-		}
+		if err := json.Unmarshal(req.Object.Raw, &w); err != nil { return toError(err) }
+		if !hasRequiredLabels(w.Metadata.Labels) { return deny("missing required labels") }
 		return allow("ok")
 
 	default:
@@ -154,8 +124,8 @@ func admitValidate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionRespons
 // --- Helpers ---
 
 type patchOp struct {
-	Op    string      `json:"op"`
-	Path  string      `json:"path"`
+	Op string `json:"op"`
+	Path string `json:"path"`
 	Value interface{} `json:"value,omitempty"`
 }
 
@@ -163,57 +133,47 @@ func ensureLabels(meta metav1.ObjectMeta) []patchOp {
 	ops := []patchOp{}
 	lbls := meta.Labels
 	if lbls == nil {
-		ops = append(ops, patchOp{Op: "add", Path: "/metadata/labels", Value: map[string]string{}})
+		ops = append(ops, patchOp{Op:"add", Path:"/metadata/labels", Value: map[string]string{}})
 	}
 	if !hasRequiredLabels(lbls) {
-		ops = append(ops, patchOp{Op: "add", Path: "/metadata/labels/app.kubernetes.io~1part-of", Value: labelPartOfValue})
-		ops = append(ops, patchOp{Op: "add", Path: "/metadata/labels/project", Value: labelProjectVal})
+		ops = append(ops, patchOp{Op:"add", Path:"/metadata/labels/app.kubernetes.io~1part-of", Value: labelPartOfValue})
+		ops = append(ops, patchOp{Op:"add", Path:"/metadata/labels/project", Value: labelProjectVal})
 	}
 	return ops
 }
 
 func hasRequiredLabels(m map[string]string) bool {
-	if m == nil {
-		return false
-	}
-	if m[labelPartOfKey] != labelPartOfValue {
-		return false
-	}
-	if m[labelProjectKey] != labelProjectVal {
-		return false
-	}
+	if m == nil { return false }
+	if m[labelPartOfKey] != labelPartOfValue { return false }
+	if m[labelProjectKey] != labelProjectVal { return false }
 	return true
 }
 
 func patchResponse(ops []patchOp) *admissionv1.AdmissionResponse {
-	if len(ops) == 0 {
-		return allow("no changes")
-	}
+	if len(ops) == 0 { return allow("no changes") }
 	b, _ := json.Marshal(ops)
 	t := admissionv1.PatchTypeJSONPatch
-	return &admissionv1.AdmissionResponse{Allowed: true, Patch: b, PatchType: &t}
+	return &admissionv1.AdmissionResponse{Allowed:true, Patch:b, PatchType:&t}
 }
 
 func allow(msg string) *admissionv1.AdmissionResponse {
-	return &admissionv1.AdmissionResponse{Allowed: true, Result: &metav1.Status{Message: msg}}
+	return &admissionv1.AdmissionResponse{Allowed:true, Result:&metav1.Status{Message:msg}}
 }
 
 func deny(msg string) *admissionv1.AdmissionResponse {
-	return &admissionv1.AdmissionResponse{Allowed: false, Result: &metav1.Status{Reason: metav1.StatusReason(msg)}}
+	return &admissionv1.AdmissionResponse{Allowed:false, Result:&metav1.Status{Reason:metav1.StatusReason(msg)}}
 }
 
 func toError(err error) *admissionv1.AdmissionResponse {
-	return &admissionv1.AdmissionResponse{Allowed: false, Result: &metav1.Status{Message: err.Error()}}
+	return &admissionv1.AdmissionResponse{Allowed:false, Result:&metav1.Status{Message:err.Error()}}
 }
 
 func writeReview(w http.ResponseWriter, ar interface{}) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type","application/json")
 	_ = json.NewEncoder(w).Encode(ar)
 }
 
 func getEnv(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
+	if v := os.Getenv(k); v != "" { return v }
 	return def
 }
