@@ -100,9 +100,10 @@ func admitValidate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionRespons
 			return deny("missing required labels: app.kubernetes.io/part-of=free5gc and project=free5gc")
 		}
 		for _, c := range obj.Spec.Template.Spec.Containers {
-			if c.Resources.Requests == nil || c.Resources.Limits == nil {
-				return deny("all containers must define resources.requests and resources.limits")
-			}
+			//Wyłączone na czas instalacji free5gc
+			//if c.Resources.Requests == nil || c.Resources.Limits == nil {
+			//	return deny("all containers must define resources.requests and resources.limits")
+			//}
 			if c.SecurityContext != nil && c.SecurityContext.Privileged != nil && *c.SecurityContext.Privileged {
 				return deny("privileged containers are not allowed")
 			}
