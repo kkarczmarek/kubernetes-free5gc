@@ -1,0 +1,31 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: free5gc-mutating
+  annotations:
+    cert-manager.io/inject-ca-from: admission-system/webhook-tls
+webhooks:
+  - name: mutate.free5gc.local
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    clientConfig:
+      service:
+        name: webhook-svc
+        namespace: admission-system
+        path: /mutate
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: ["5g-core"]
+    rules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE","UPDATE"]
+        resources: ["deployments","statefulsets","daemonsets"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE","UPDATE"]
+        resources: ["services","configmaps","secrets"]

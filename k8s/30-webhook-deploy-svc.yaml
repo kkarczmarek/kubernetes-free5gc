@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admission-webhook
+  namespace: admission-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: admission-webhook }
+  template:
+    metadata:
+      labels: { app: admission-webhook }
+    spec:
+      containers:
+        - name: server
+          image: IMAGE_PLACEHOLDER
+          args: ["--tls-cert-file=/tls/tls.crt","--tls-private-key-file=/tls/tls.key"]
+          ports: [{ containerPort: 8443 }]
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8443, scheme: HTTPS }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8443, scheme: HTTPS }
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: webhook-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-svc
+  namespace: admission-system
+spec:
+  selector: { app: admission-webhook }
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8443

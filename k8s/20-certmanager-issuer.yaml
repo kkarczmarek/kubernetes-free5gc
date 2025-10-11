@@ -1,0 +1,21 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: admission-selfsigned
+  namespace: admission-system
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: webhook-tls
+  namespace: admission-system
+spec:
+  secretName: webhook-tls
+  duration: 8760h
+  dnsNames:
+    - webhook-svc.admission-system.svc
+    - webhook-svc.admission-system.svc.cluster.local
+  issuerRef:
+    name: admission-selfsigned

@@ -1,0 +1,16 @@
+# Values tailored for GCP worker hosting UPF with second NIC (eth1)
+namespace: 5g-core
+commonLabels:
+  app.kubernetes.io/part-of: free5gc
+  project: free5gc
+
+upf:
+  nodeSelector:
+    upf: "enabled"
+  n6if: "eth1"
+  n3if: "eth0"
+  extraEnv:
+    - name: N6_INTERFACE
+      value: "eth1"
+    - name: N3_INTERFACE
+      value: "eth0"

@@ -1,0 +1,5 @@
+# Minimal overrides for upstream free5GC chart
+namespace: 5g-core
+commonLabels:
+  app.kubernetes.io/part-of: free5gc
+  project: free5gc
