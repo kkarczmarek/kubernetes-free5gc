@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: bad-image
-  namespace: 5g-core
+  namespace: free5gc
   labels:
     app.kubernetes.io/part-of: free5gc
     project: free5gc

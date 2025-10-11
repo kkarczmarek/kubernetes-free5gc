@@ -1,0 +1,47 @@
+free5gc-nef:      { enabled: false }
+free5gc-chf:      { enabled: false }
+free5gc-nssf:     { enabled: false }
+free5gc-pcf:      { enabled: false }
+free5gc-webui:    { enabled: false }
+free5gc-dbpython: { enabled: false }
+
+# TNIUT - niewielkie requesty
+free5gc-nrf.nrf.resources.requests.cpu: "20m"
+free5gc-nrf.nrf.resources.requests.memory: "96Mi"
+
+free5gc-udr.udr.resources.requests.cpu: "20m"
+free5gc-udr.udr.resources.requests.memory: "96Mi"
+
+free5gc-udm.udm.resources.requests.cpu: "20m"
+free5gc-udm.udm.resources.requests.memory: "96Mi"
+
+free5gc-ausf.ausf.resources.requests.cpu: "20m"
+free5gc-ausf.ausf.resources.requests.memory: "96Mi"
+
+free5gc-amf.amf.resources.requests.cpu: "30m"
+free5gc-amf.amf.resources.requests.memory: "128Mi"
+
+free5gc-smf.smf.resources.requests.cpu: "40m"
+free5gc-smf.smf.resources.requests.memory: "128Mi"
+
+# Zostawiamy 1×UPF (ten z Twoim nodeSelector na workernode z gtp5g)
+free5gc-upf:  { enabled: false }
+free5gc-upf2: { enabled: false }
+free5gc-upfb: { enabled: false }
+free5gc-upf1:
+  enabled: true
+  upf:
+    resources:
+      requests:
+        cpu: "60m"
+        memory: "128Mi"
+
+# MongoDB z ECR i małe requesty
+mongodb:
+  image:
+    repository: public.ecr.aws/bitnami/mongodb
+    tag: "7.0.15"
+  resources:
+    requests:
+      cpu: "80m"
+      memory: "256Mi"

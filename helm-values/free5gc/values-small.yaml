@@ -1,0 +1,81 @@
+# Wyłącz zbędne funkcje na start
+free5gc-nef:
+  enabled: false
+free5gc-chf:
+  enabled: false
+free5gc-nssf:
+  enabled: false
+free5gc-dbpython:
+  enabled: false
+
+# Zostawiamy minimalny zestaw NF
+free5gc-nrf:
+  nrf:
+    resources:
+      requests: { cpu: "50m",  memory: "128Mi" }
+      limits:   { cpu: "200m", memory: "256Mi" }
+
+free5gc-udr:
+  udr:
+    resources:
+      requests: { cpu: "50m",  memory: "128Mi" }
+      limits:   { cpu: "200m", memory: "256Mi" }
+
+free5gc-udm:
+  udm:
+    resources:
+      requests: { cpu: "50m",  memory: "128Mi" }
+      limits:   { cpu: "200m", memory: "256Mi" }
+
+free5gc-ausf:
+  ausf:
+    resources:
+      requests: { cpu: "50m",  memory: "128Mi" }
+      limits:   { cpu: "200m", memory: "256Mi" }
+
+free5gc-pcf:
+  pcf:
+    resources:
+      requests: { cpu: "50m",  memory: "128Mi" }
+      limits:   { cpu: "200m", memory: "256Mi" }
+
+free5gc-smf:
+  smf:
+    resources:
+      requests: { cpu: "50m",  memory: "128Mi" }
+      limits:   { cpu: "300m", memory: "256Mi" }
+
+free5gc-amf:
+  amf:
+    resources:
+      requests: { cpu: "50m",  memory: "128Mi" }
+    # AMF potrafi być wrażliwy – zostawimy bez limitu CPU, tylko małe requesty
+
+free5gc-webui:
+  webui:
+    resources:
+      requests: { cpu: "20m",  memory: "64Mi" }
+      limits:   { cpu: "100m", memory: "128Mi" }
+
+# Zostawiamy JEDEN UPF (upf1) – przypinany na workernode przez Twój values-upf-gcp.yaml
+free5gc-upf:
+  enabled: false
+free5gc-upf2:
+  enabled: false
+free5gc-upfb:
+  enabled: false
+free5gc-upf1:
+  enabled: true
+  upf:
+    resources:
+      requests: { cpu: "80m",  memory: "128Mi" }
+      limits:   { cpu: "400m", memory: "512Mi" }
+
+# MongoDB – przeniesione na ECR (stabilniejszy tag), też mniejsze requesty
+mongodb:
+  image:
+    repository: public.ecr.aws/bitnami/mongodb
+    tag: "7.0.15"
+  resources:
+    requests: { cpu: "80m",  memory: "256Mi" }
+    limits:   { cpu: "500m", memory: "1Gi" }

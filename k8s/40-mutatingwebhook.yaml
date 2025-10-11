@@ -19,7 +19,7 @@ webhooks:
       matchExpressions:
         - key: kubernetes.io/metadata.name
           operator: In
-          values: ["5g-core"]
+          values: ["free5gc"]
     rules:
       - apiGroups: ["apps"]
         apiVersions: ["v1"]

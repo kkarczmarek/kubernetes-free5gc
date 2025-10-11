@@ -1,0 +1,6 @@
+global:
+  n2network: { master: ens4, masterIf: ens4 }
+  n3network: { master: ens4, masterIf: ens4 }
+  n4network: { master: ens4, masterIf: ens4 }
+  n6network: { master: ens5, masterIf: ens5 }
+  n9network: { master: ens4, masterIf: ens4 }

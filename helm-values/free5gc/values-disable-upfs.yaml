@@ -1,0 +1,4 @@
+free5gc-upf:   { enabled: false }
+free5gc-upf2:  { enabled: false }
+free5gc-upfb:  { enabled: false }
+free5gc-upf1:  { enabled: true  }
