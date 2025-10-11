@@ -10,12 +10,11 @@ import (
 
 	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
-	requiredNS       = "5g-core"
+	requiredNS       = "free5gc" // zmieniasz tu, jeśli używasz innego ns
 	labelPartOfKey   = "app.kubernetes.io/part-of"
 	labelProjectKey  = "project"
 	labelPartOfValue = "free5gc"
@@ -33,7 +32,8 @@ func main() {
 	http.HandleFunc("/validate", serve(admitValidate))
 
 	server := &http.Server{Addr: ":8443"}
-	// Load TLS
+
+	// TLS jeżeli są certy
 	if _, err := os.Stat(cert); err == nil {
 		cfg := &tls.Config{}
 		pair, err := tls.LoadX509KeyPair(cert, key)
@@ -45,6 +45,7 @@ func main() {
 		log.Printf("listening on https://0.0.0.0:8443")
 		log.Fatal(server.ListenAndServeTLS("", ""))
 	} else {
+		// tryb developerski (HTTP)
 		log.Printf("TLS cert not found, serving HTTP (dev only) on :8080")
 		server.Addr = ":8080"
 		log.Fatal(server.ListenAndServe())
@@ -55,21 +56,17 @@ func serve(f admitFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var review admissionv1.AdmissionReview
 		if err := json.NewDecoder(r.Body).Decode(&review); err != nil {
-			writeReview(w, toError(err))
+			out := admissionv1.AdmissionReview{Response: toError(fmt.Errorf("decode: %w", err))}
+			writeReview(w, &out)
 			return
 		}
 		resp := f(review)
 		out := admissionv1.AdmissionReview{TypeMeta: review.TypeMeta, Response: resp}
-		out.Response.UID = review.Request.UID
+		if review.Request != nil {
+			out.Response.UID = review.Request.UID
+		}
 		writeReview(w, &out)
 	}
-}
-
-func toError(err error) *admissionv1.AdmissionResponse {
-    return &admissionv1.AdmissionResponse{
-        Allowed: false,
-        Result:  &metav1.Status{Message: err.Error()},
-    }
 }
 
 func admitMutate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
@@ -77,8 +74,6 @@ func admitMutate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse 
 	if req == nil {
 		return allow("no request")
 	}
-
-	// Only mutate namespaced objects in required namespace
 	if req.Namespace != requiredNS {
 		return allow("outside target namespace")
 	}
@@ -91,20 +86,19 @@ func admitMutate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse 
 		}
 		patchOps := ensureLabels(obj.ObjectMeta)
 		return patchResponse(patchOps)
-	case "StatefulSet", "DaemonSet":
-		return allow("no-op for now")
+
 	case "Service", "ConfigMap", "Secret":
-		// Extract only metadata for labels
-		var meta metav1.ObjectMeta
+		// wyciągnij same metadata
 		type metaWrapper struct {
 			Metadata metav1.ObjectMeta `json:"metadata"`
 		}
 		var w metaWrapper
-		if err := json.Unmarshal(req.Object.Raw, &w); err == nil {
-			meta = w.Metadata
+		if err := json.Unmarshal(req.Object.Raw, &w); err != nil {
+			return toError(err)
 		}
-		patchOps := ensureLabels(meta)
+		patchOps := ensureLabels(w.Metadata)
 		return patchResponse(patchOps)
+
 	default:
 		return allow("kind not targeted")
 	}
@@ -125,11 +119,10 @@ func admitValidate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionRespons
 		if err := json.Unmarshal(req.Object.Raw, &obj); err != nil {
 			return toError(err)
 		}
-		// Labels present?
 		if !hasRequiredLabels(obj.ObjectMeta.Labels) {
 			return deny("missing required labels: app.kubernetes.io/part-of=free5gc and project=free5gc")
 		}
-		// Basic security & resources checks
+		// minimalne sprawdzenie zasobów/privileged
 		for _, c := range obj.Spec.Template.Spec.Containers {
 			if c.Resources.Requests == nil || c.Resources.Limits == nil {
 				return deny("all containers must define resources.requests and resources.limits")
@@ -137,11 +130,10 @@ func admitValidate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionRespons
 			if c.SecurityContext != nil && c.SecurityContext.Privileged != nil && *c.SecurityContext.Privileged {
 				return deny("privileged containers are not allowed")
 			}
-			_ = corev1.Container{} // to ensure corev1 import remains
 		}
 		return allow("ok")
+
 	case "Service", "ConfigMap", "Secret":
-		// Extract labels
 		type metaWrapper struct {
 			Metadata metav1.ObjectMeta `json:"metadata"`
 		}
@@ -153,12 +145,13 @@ func admitValidate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionRespons
 			return deny("missing required labels")
 		}
 		return allow("ok")
+
 	default:
 		return allow("kind not validated")
 	}
 }
 
-// Helpers
+// --- Helpers ---
 
 type patchOp struct {
 	Op    string      `json:"op"`
@@ -168,27 +161,25 @@ type patchOp struct {
 
 func ensureLabels(meta metav1.ObjectMeta) []patchOp {
 	ops := []patchOp{}
-	labels := meta.Labels
-	if labels == nil {
-		// add labels map
+	lbls := meta.Labels
+	if lbls == nil {
 		ops = append(ops, patchOp{Op: "add", Path: "/metadata/labels", Value: map[string]string{}})
 	}
-	if !hasRequiredLabels(labels) {
-		// add keys individually (JSON Pointer escape for '/')
+	if !hasRequiredLabels(lbls) {
 		ops = append(ops, patchOp{Op: "add", Path: "/metadata/labels/app.kubernetes.io~1part-of", Value: labelPartOfValue})
 		ops = append(ops, patchOp{Op: "add", Path: "/metadata/labels/project", Value: labelProjectVal})
 	}
 	return ops
 }
 
-func hasRequiredLabels(lbls map[string]string) bool {
-	if lbls == nil {
+func hasRequiredLabels(m map[string]string) bool {
+	if m == nil {
 		return false
 	}
-	if lbls[labelPartOfKey] != labelPartOfValue {
+	if m[labelPartOfKey] != labelPartOfValue {
 		return false
 	}
-	if lbls[labelProjectKey] != labelProjectVal {
+	if m[labelProjectKey] != labelProjectVal {
 		return false
 	}
 	return true
@@ -211,15 +202,18 @@ func deny(msg string) *admissionv1.AdmissionResponse {
 	return &admissionv1.AdmissionResponse{Allowed: false, Result: &metav1.Status{Reason: metav1.StatusReason(msg)}}
 }
 
+func toError(err error) *admissionv1.AdmissionResponse {
+	return &admissionv1.AdmissionResponse{Allowed: false, Result: &metav1.Status{Message: err.Error()}}
+}
+
 func writeReview(w http.ResponseWriter, ar interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(ar)
 }
 
 func getEnv(k, def string) string {
-	v := os.Getenv(k)
-	if v == "" {
-		return def
+	if v := os.Getenv(k); v != "" {
+		return v
 	}
-	return v
+	return def
 }
