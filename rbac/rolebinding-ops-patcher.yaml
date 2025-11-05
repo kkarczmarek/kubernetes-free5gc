@@ -1,0 +1,13 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ops-patcher-binding
+  namespace: free5gc
+subjects:
+- kind: User
+  name: alice@example.com
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: ops-patcher
+  apiGroup: rbac.authorization.k8s.io

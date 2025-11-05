@@ -1,0 +1,22 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-signed-images
+spec:
+  validationFailureAction: Enforce
+  rules:
+  - name: require-signed
+    match:
+      any:
+      - resources:
+          kinds: ["Pod","Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+          namespaces: ["free5gc"]
+    verifyImages:
+    - image: "*"
+      attestors:
+      - entries:
+        - keys:
+            publicKeys: |-
+              -----BEGIN PUBLIC KEY-----
+              # TODO: wstaw klucz Cosign / Sigstore
+              -----END PUBLIC KEY-----

@@ -1,0 +1,18 @@
+# security hygiene
+*.log
+*.tmp
+*.out
+*.swp
+**/*secret*.yaml
+**/secrets/**
+kubeconfig
+.kube/
+*.crt
+*.key
+*.pem
+*.p12
+.env
+.env.*
+.idea/
+.vscode/
+__pycache__/

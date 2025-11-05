@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-sig-plane
+  namespace: free5gc
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress","Egress"]
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          project: free5gc
+    - podSelector: {}
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          project: free5gc
