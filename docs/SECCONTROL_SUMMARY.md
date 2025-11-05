@@ -1,4 +1,4 @@
-# Kontrola dostępu w Kubernetes — skrót dla promotora
+# Kontrola dostępu w Kubernetes
 
 ## Teza
 Praktyczne wdrożenie i egzekwowanie zaawansowanej kontroli dostępu: RBAC (least privilege), Pod Security (PSA), NetworkPolicy, reguły admission (Kyverno), oraz bezpieczny workflow Git.
