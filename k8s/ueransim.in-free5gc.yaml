@@ -1,0 +1,162 @@
+# gNB config – ngap IP po Multus (N2), linkIp/gtpIp po eth0 (POD_IP)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gnb-config
+  namespace: free5gc
+  labels: { project: free5gc }
+data:
+  gnb.yaml.tmpl: |
+    mcc: "208"
+    mnc: "93"
+    nci: "0x000000010"
+    gnbId: "0x000000010"
+    gnbName: "UERANSIM-gNB"
+    tac: 1
+
+    # UE<->gNB i GTP do UPF po eth0
+    linkIp: "__POD_IP__"
+    gtpIp: "__POD_IP__"
+
+    # NGAP (N2) po Multus z adresem stałym
+    ngapIp: "10.100.50.250"
+
+    amfConfigs:
+      - address: "10.100.50.249"
+        port: 38412
+
+    slices:
+      - sst: 1
+        sd: "000001"
+---
+# UE config – gNB przez Service (UDP/4997) w free5gc
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ue-config
+  namespace: free5gc
+  labels: { project: free5gc }
+data:
+  ue.yaml: |
+    supi: "imsi-208930000000003"
+    mcc: "208"
+    mnc: "93"
+    key: "8baf473f2f8fd09487cccbd7097c6862"
+    opType: "OPC"
+    opValue: "8e27b6af0e692e750f32667a3b14605d"
+    amf: "8000"
+    imei: "356938035643809"
+    imeisv: "4370816125816151"
+    gnbSearchList:
+      - "ueransim-gnb.free5gc.svc.cluster.local"
+    uacAic:
+      mps: false
+      mcs: false
+    sessions:
+      - type: "IPv4"
+        apn: "internet"
+        slice:
+          sst: 1
+          sd: "000001"
+---
+# Service dla UE->gNB (UDP/4997)
+apiVersion: v1
+kind: Service
+metadata:
+  name: ueransim-gnb
+  namespace: free5gc
+  labels: { app: ueransim-gnb, project: free5gc }
+spec:
+  selector:
+    app: ueransim-gnb
+  ports:
+    - name: uelink
+      port: 4997
+      targetPort: 4997
+      protocol: UDP
+---
+# gNB Deployment (N2 via Multus + pinning na controlplane)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ueransim-gnb
+  namespace: free5gc
+  labels: { app: ueransim-gnb, project: free5gc }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ueransim-gnb }
+  template:
+    metadata:
+      labels: { app: ueransim-gnb, project: free5gc }
+      annotations:
+        k8s.v1.cni.cncf.io/networks: |-
+          [{
+            "name": "free5gc/n2network-free5gc-helm-free5gc-amf",
+            "interface": "n2",
+            "ips": ["10.100.50.250/29"],
+            "gateway": ["10.100.50.254"]
+          }]
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: controlplane
+      containers:
+        - name: gnb
+          image: ueransim/ueransim:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: true
+            capabilities: { add: ["NET_ADMIN","NET_RAW"] }
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+          env:
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+          volumeMounts:
+            - name: gnb-config
+              mountPath: /config
+          command: ["/bin/sh","-lc"]
+          args:
+            - sed -e "s/__POD_IP__/${POD_IP}/g" /config/gnb.yaml.tmpl > /work-gnb.yaml
+              && exec nr-gnb -c /work-gnb.yaml
+      volumes:
+        - name: gnb-config
+          configMap: { name: gnb-config }
+---
+# UE Deployment (/dev/net/tun + NET_ADMIN)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ueransim-ue
+  namespace: free5gc
+  labels: { app: ueransim-ue, project: free5gc }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ueransim-ue }
+  template:
+    metadata:
+      labels: { app: ueransim-ue, project: free5gc }
+    spec:
+      containers:
+        - name: ue
+          image: ueransim/ueransim:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: true
+            capabilities: { add: ["NET_ADMIN","NET_RAW"] }
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+          volumeMounts:
+            - name: ue-config
+              mountPath: /config
+            - name: tun
+              mountPath: /dev/net/tun
+          command: ["nr-ue","-c","/config/ue.yaml"]
+      volumes:
+        - name: ue-config
+          configMap: { name: ue-config }
+        - name: tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice

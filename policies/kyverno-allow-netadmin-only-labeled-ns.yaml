@@ -1,0 +1,26 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: allow-netadmin-only-labeled-ns
+spec:
+  validationFailureAction: Enforce
+  rules:
+  - name: block-netadmin-cap
+    match:
+      any:
+      - resources:
+          kinds: ["Pod","Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+    preconditions:
+      all:
+      - key: "{{ request.object.metadata.namespace | default('default') | lookup('Namespace','',request.object.metadata.namespace).metadata.labels['security.allow-netadmin'] || 'false' }}"
+        operator: Equals
+        value: "true"
+    validate:
+      message: "NET_ADMIN dozwolony tylko w namespace z label `security.allow-netadmin=true`."
+      pattern:
+        spec:
+          containers:
+          - =(securityContext):
+              =(capabilities):
+                =(add):
+                - "NET_ADMIN"

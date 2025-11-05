@@ -1,0 +1,144 @@
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ueransim
+---
+# gNB config (szablon – gtpIp wstrzykniemy przez POD_IP)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gnb-config
+  namespace: ueransim
+data:
+  gnb.yaml.tmpl: |
+    mcc: "208"
+    mnc: "93"
+    nci: "0x000000010"
+    gnbId: "0x000000010"
+    gnbName: "UERANSIM-gNB"
+    tac: 1
+
+    linkIp: "10.100.50.250"
+    ngapIp: "10.100.50.250"
+    gtpIp: "__GTP_IP__"
+
+    amfConfigs:
+      - address: "10.100.50.249"
+        port: 38412
+
+    slices:
+      - sst: 1
+        sd: "000001"
+---
+# UE config (upewnij się, że taki abonent jest w WebUI)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ue-config
+  namespace: ueransim
+data:
+  ue.yaml: |
+    supi: "imsi-208930000000003"
+    mcc: "208"
+    mnc: "93"
+    key: "8baf473f2f8fd09487cccbd7097c6862"
+    opType: "OPC"
+    opValue: "8e27b6af0e692e750f32667a3b14605d"
+    amf: "8000"
+    imei: "356938035643809"
+    imeisv: "4370816125816151"
+    gnbSearchList:
+      - "10.100.50.250"
+    uacAic:
+      mps: false
+      mcs: false
+    sessions:
+      - type: "IPv4"
+        apn: "internet"
+        slice:
+          sst: 1
+          sd: "000001"
+---
+# gNB (N2 przez Multus – IP 10.100.50.250/29; N3 = eth0)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ueransim-gnb
+  namespace: ueransim
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ueransim-gnb
+  template:
+    metadata:
+      labels:
+        app: ueransim-gnb
+      annotations:
+        k8s.v1.cni.cncf.io/networks: |-
+          [{
+            "name": "free5gc/n2network-free5gc-helm-free5gc-amf",
+            "interface": "n2",
+            "ips": ["10.100.50.250/29"],
+            "gateway": ["10.100.50.254"]
+          }]
+    spec:
+      containers:
+        - name: gnb
+          image: ghcr.io/aligungr/ueransim:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities: { add: ["NET_ADMIN","NET_RAW"] }
+            allowPrivilegeEscalation: true
+          env:
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+          volumeMounts:
+            - name: gnb-config
+              mountPath: /config
+          command: ["/bin/sh","-lc"]
+          args:
+            - sed "s/__GTP_IP__/${POD_IP}/g" /config/gnb.yaml.tmpl > /work-gnb.yaml && exec nr-gnb -c /work-gnb.yaml
+      volumes:
+        - name: gnb-config
+          configMap:
+            name: gnb-config
+---
+# UE (/dev/net/tun + NET_ADMIN)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ueransim-ue
+  namespace: ueransim
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ueransim-ue
+  template:
+    metadata:
+      labels:
+        app: ueransim-ue
+    spec:
+      containers:
+        - name: ue
+          image: ghcr.io/aligungr/ueransim:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities: { add: ["NET_ADMIN","NET_RAW"] }
+            allowPrivilegeEscalation: true
+          volumeMounts:
+            - name: ue-config
+              mountPath: /config
+            - name: tun
+              mountPath: /dev/net/tun
+          command: ["nr-ue","-c","/config/ue.yaml"]
+      volumes:
+        - name: ue-config
+          configMap:
+            name: ue-config
+        - name: tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice

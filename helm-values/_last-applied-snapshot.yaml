@@ -1,0 +1,81 @@
+USER-SUPPLIED VALUES:
+commonLabels:
+  app.kubernetes.io/part-of: free5gc
+  project: free5gc
+free5gc-amf.amf.resources.requests.cpu: 30m
+free5gc-amf.amf.resources.requests.memory: 128Mi
+free5gc-ausf.ausf.resources.requests.cpu: 20m
+free5gc-ausf.ausf.resources.requests.memory: 96Mi
+free5gc-chf:
+  enabled: false
+free5gc-dbpython:
+  enabled: false
+free5gc-nef:
+  enabled: false
+free5gc-nrf.nrf.resources.requests.cpu: 20m
+free5gc-nrf.nrf.resources.requests.memory: 96Mi
+free5gc-nssf:
+  enabled: false
+free5gc-pcf:
+  enabled: false
+free5gc-smf.smf.resources.requests.cpu: 40m
+free5gc-smf.smf.resources.requests.memory: 128Mi
+free5gc-udm.udm.resources.requests.cpu: 20m
+free5gc-udm.udm.resources.requests.memory: 96Mi
+free5gc-udr.udr.resources.requests.cpu: 20m
+free5gc-udr.udr.resources.requests.memory: 96Mi
+free5gc-upf:
+  enabled: false
+free5gc-upf1:
+  enabled: true
+  upf:
+    resources:
+      requests:
+        cpu: 60m
+        memory: 128Mi
+free5gc-upf2:
+  enabled: false
+free5gc-upfb:
+  enabled: false
+free5gc-webui:
+  enabled: false
+global:
+  n2network:
+    master: ens4
+    masterIf: ens4
+  n3network:
+    master: ens4
+    masterIf: ens4
+  n4network:
+    master: ens4
+    masterIf: ens4
+  n6network:
+    master: ens5
+    masterIf: ens5
+  n9network:
+    master: ens4
+    masterIf: ens4
+mongodb:
+  architecture: standalone
+  image:
+    registry: public.ecr.aws
+    repository: bitnami/mongodb
+    tag: "6.0"
+  nodeSelector:
+    kubernetes.io/hostname: controlplane
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 20m
+      memory: 96Mi
+namespace: free5gc
+upf:
+  extraEnv:
+  - name: N6_INTERFACE
+    value: eth1
+  - name: N3_INTERFACE
+    value: eth0
+  n3if: eth0
+  n6if: eth1
+  nodeSelector:
+    upf: enabled
