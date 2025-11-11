@@ -1,3 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-svc
+  namespace: admission-system
+spec:
+  selector:
+    app: admission-webhook
+  ports:
+    - port: 443
+      targetPort: 8443
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,37 +18,44 @@ metadata:
 spec:
   replicas: 2
   selector:
-    matchLabels: { app: admission-webhook }
+    matchLabels:
+      app: admission-webhook
   template:
     metadata:
-      labels: { app: admission-webhook }
+      labels:
+        app: admission-webhook
     spec:
       containers:
         - name: server
           image: IMAGE_PLACEHOLDER
-          args: ["--tls-cert-file=/tls/tls.crt","--tls-private-key-file=/tls/tls.key"]
-          ports: [{ containerPort: 8443 }]
-          readinessProbe:
-            httpGet: { path: /healthz, port: 8443, scheme: HTTPS }
-          livenessProbe:
-            httpGet: { path: /healthz, port: 8443, scheme: HTTPS }
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8443
+          env:
+            - name: DEFAULT_CPU_REQUEST
+              value: "50m"
+            - name: DEFAULT_MEM_REQUEST
+              value: "128Mi"
+            - name: DEFAULT_CPU_LIMIT
+              value: "500m"
+            - name: DEFAULT_MEM_LIMIT
+              value: "512Mi"
+            - name: FREE5GC_NAMESPACE
+              value: "free5gc"
+            - name: DATA_CIDR
+              value: "10.100.50.0/24"
+            - name: ALLOWED_REGISTRIES
+              value: "ghcr.io,public.ecr.aws,docker.io"
+            - name: DENY_LATEST_TAG
+              value: "true"
           volumeMounts:
             - name: tls
               mountPath: /tls
               readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
       volumes:
         - name: tls
           secret:
             secretName: webhook-tls
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: webhook-svc
-  namespace: admission-system
-spec:
-  selector: { app: admission-webhook }
-  ports:
-    - name: https
-      port: 443
-      targetPort: 8443

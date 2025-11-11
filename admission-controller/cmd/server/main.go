@@ -1,180 +1,441 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"regexp"
+	"strconv"
+	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
-	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
-const (
-	requiredNS       = "free5gc"
-	labelPartOfKey   = "app.kubernetes.io/part-of"
-	labelProjectKey  = "project"
-	labelPartOfValue = "free5gc"
-	labelProjectVal  = "free5gc"
+var (
+	scheme       = runtime.NewScheme()
+	codecs       = serializer.NewCodecFactory(scheme)
+	deserializer = codecs.UniversalDeserializer()
+
+	// domyślne wartości (można nadpisać env w Deployment)
+	defaultCPURequest = getenv("DEFAULT_CPU_REQUEST", "50m")
+	defaultMemRequest = getenv("DEFAULT_MEM_REQUEST", "128Mi")
+	defaultCPULimit   = getenv("DEFAULT_CPU_LIMIT", "500m")
+	defaultMemLimit   = getenv("DEFAULT_MEM_LIMIT", "512Mi")
+
+	projectLabelKey   = "project"
+	partOfLabelKey    = "app.kubernetes.io/part-of"
+	projectLabelValue = getenv("PROJECT_LABEL_VALUE", "free5gc")
+	partOfLabelValue  = getenv("PARTOF_LABEL_VALUE", "free5gc")
+
+	free5gcNamespace  = getenv("FREE5GC_NAMESPACE", "free5gc")
+	dataPlaneCIDR     = getenv("DATA_CIDR", "10.100.50.0/24")
+	allowedRegistries = strings.Split(getenv("ALLOWED_REGISTRIES", "ghcr.io,public.ecr.aws,docker.io"), ",")
+
+	denyLatestTag, _ = strconv.ParseBool(getenv("DENY_LATEST_TAG", "true"))
 )
 
-type admitFunc func(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse
+func getenv(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+func writeReview(w http.ResponseWriter, ar admissionv1.AdmissionReview) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(ar)
+}
+
+func toError(ar *admissionv1.AdmissionReview, uid string, err error) {
+	ar.Response = &admissionv1.AdmissionResponse{
+		UID:     uid,
+		Allowed: false,
+		Result:  &metav1.Status{Message: err.Error()},
+	}
+}
 
 func main() {
-	cert := getEnv("TLS_CERT", "/tls/tls.crt")
-	key := getEnv("TLS_KEY", "/tls/tls.key")
+	certFile := getenv("TLS_CERT_FILE", "/tls/tls.crt")
+	keyFile := getenv("TLS_KEY_FILE", "/tls/tls.key")
 
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	http.HandleFunc("/mutate", serve(admitMutate))
-	http.HandleFunc("/validate", serve(admitValidate))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	})
+	mux.HandleFunc("/mutate", handleMutate)
+	mux.HandleFunc("/validate", handleValidate)
 
-	server := &http.Server{Addr: ":8443"}
+	srv := &http.Server{
+		Addr:    ":8443",
+		Handler: mux,
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	}
 
-	if _, err := os.Stat(cert); err == nil {
-		cfg := &tls.Config{}
-		pair, err := tls.LoadX509KeyPair(cert, key)
-		if err != nil { log.Fatalf("load key pair: %v", err) }
-		cfg.Certificates = []tls.Certificate{pair}
-		server.TLSConfig = cfg
-		log.Printf("listening on https://0.0.0.0:8443")
-		log.Fatal(server.ListenAndServeTLS("", ""))
-	} else {
-		log.Printf("TLS cert not found, serving HTTP (dev only) on :8080")
-		server.Addr = ":8080"
-		log.Fatal(server.ListenAndServe())
+	log.Printf("starting webhook server on :8443")
+	if err := srv.ListenAndServeTLS(certFile, keyFile); err != nil {
+		log.Fatalf("server: %v", err)
 	}
 }
 
-func serve(f admitFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var review admissionv1.AdmissionReview
-		if err := json.NewDecoder(r.Body).Decode(&review); err != nil {
-			out := admissionv1.AdmissionReview{Response: toError(fmt.Errorf("decode: %w", err))}
-			writeReview(w, &out)
-			return
-		}
-		resp := f(review)
-		out := admissionv1.AdmissionReview{TypeMeta: review.TypeMeta, Response: resp}
-		if review.Request != nil { out.Response.UID = review.Request.UID }
-		writeReview(w, &out)
-	}
-}
+// ---------------- MUTATE ----------------
 
-func admitMutate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
-	req := ar.Request
-	if req == nil { return allow("no request") }
-	if req.Namespace != requiredNS { return allow("outside target namespace") }
+func handleMutate(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var review admissionv1.AdmissionReview
+	if _, _, err := deserializer.Decode(body, nil, &review); err != nil {
+		http.Error(w, fmt.Sprintf("could not decode request: %v", err), http.StatusBadRequest)
+		return
+	}
+	req := review.Request
+	resp := &admissionv1.AdmissionResponse{UID: req.UID, Allowed: true}
 
 	switch req.Kind.Kind {
-	case "Deployment":
-		var obj appsv1.Deployment
-		if err := json.Unmarshal(req.Object.Raw, &obj); err != nil { return toError(err) }
-		patchOps := ensureLabels(obj.ObjectMeta)
-		return patchResponse(patchOps)
-
-	case "Service", "ConfigMap", "Secret":
-		type metaWrapper struct{ Metadata metav1.ObjectMeta `json:"metadata"` }
-		var w metaWrapper
-		if err := json.Unmarshal(req.Object.Raw, &w); err != nil { return toError(err) }
-		patchOps := ensureLabels(w.Metadata)
-		return patchResponse(patchOps)
-
-	default:
-		return allow("kind not targeted")
-	}
-}
-
-func admitValidate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
-	req := ar.Request
-	if req == nil { return allow("no request") }
-	if req.Namespace != requiredNS { return deny(fmt.Sprintf("resources must be created in namespace %s", requiredNS)) }
-
-	switch req.Kind.Kind {
-	case "Deployment":
-		var obj appsv1.Deployment
-		if err := json.Unmarshal(req.Object.Raw, &obj); err != nil { return toError(err) }
-		if !hasRequiredLabels(obj.ObjectMeta.Labels) {
-			return deny("missing required labels: app.kubernetes.io/part-of=free5gc and project=free5gc")
+	case "Pod":
+		patch, err := mutatePod(req.Object.Raw)
+		if err != nil {
+			toError(&review, req.UID, err)
+		} else if len(patch) > 0 {
+			pt := admissionv1.PatchTypeJSONPatch
+			resp.PatchType = &pt
+			resp.Patch = patch
 		}
-		for _, c := range obj.Spec.Template.Spec.Containers {
-			//Wyłączone na czas instalacji free5gc
-			//if c.Resources.Requests == nil || c.Resources.Limits == nil {
-			//	return deny("all containers must define resources.requests and resources.limits")
-			//}
-			if c.SecurityContext != nil && c.SecurityContext.Privileged != nil && *c.SecurityContext.Privileged {
-				return deny("privileged containers are not allowed")
-			}
+	case "Deployment", "StatefulSet", "DaemonSet":
+		patch, err := mutateWorkload(req.Object.Raw, req.Kind.Kind)
+		if err != nil {
+			toError(&review, req.UID, err)
+		} else if len(patch) > 0 {
+			pt := admissionv1.PatchTypeJSONPatch
+			resp.PatchType = &pt
+			resp.Patch = patch
 		}
-		return allow("ok")
-
-	case "Service", "ConfigMap", "Secret":
-		type metaWrapper struct{ Metadata metav1.ObjectMeta `json:"metadata"` }
-		var w metaWrapper
-		if err := json.Unmarshal(req.Object.Raw, &w); err != nil { return toError(err) }
-		if !hasRequiredLabels(w.Metadata.Labels) { return deny("missing required labels") }
-		return allow("ok")
-
 	default:
-		return allow("kind not validated")
+		// pass-through
 	}
-}
 
-// --- Helpers ---
+	review.Response = resp
+	writeReview(w, review)
+}
 
 type patchOp struct {
-	Op string `json:"op"`
-	Path string `json:"path"`
+	Op    string      `json:"op"`
+	Path  string      `json:"path"`
 	Value interface{} `json:"value,omitempty"`
 }
 
-func ensureLabels(meta metav1.ObjectMeta) []patchOp {
-	ops := []patchOp{}
-	lbls := meta.Labels
-	if lbls == nil {
-		ops = append(ops, patchOp{Op:"add", Path:"/metadata/labels", Value: map[string]string{}})
+func mutatePod(raw []byte) ([]byte, error) {
+	obj := &corev1.Pod{}
+	if _, _, err := deserializer.Decode(raw, nil, obj); err != nil {
+		return nil, fmt.Errorf("decode pod: %w", err)
 	}
-	if !hasRequiredLabels(lbls) {
-		ops = append(ops, patchOp{Op:"add", Path:"/metadata/labels/app.kubernetes.io~1part-of", Value: labelPartOfValue})
-		ops = append(ops, patchOp{Op:"add", Path:"/metadata/labels/project", Value: labelProjectVal})
+	var ops []patchOp
+
+	// etykiety
+	if obj.Labels == nil || obj.Labels[partOfLabelKey] == "" {
+		ops = append(ops, patchOp{Op: "add", Path: "/metadata/labels/" + escape(partOfLabelKey), Value: partOfLabelValue})
+	}
+	if obj.Labels == nil || obj.Labels[projectLabelKey] == "" {
+		ops = append(ops, patchOp{Op: "add", Path: "/metadata/labels/" + escape(projectLabelKey), Value: projectLabelValue})
+	}
+
+	// pod-level security
+	if obj.Spec.SecurityContext == nil || obj.Spec.SecurityContext.RunAsNonRoot == nil {
+		ops = append(ops, patchOp{Op: "add", Path: "/spec/securityContext/runAsNonRoot", Value: true})
+	}
+
+	// containers + initContainers
+	ops = append(ops, ensureContainers(obj.Spec.Containers, "/spec/containers")...)
+	ops = append(ops, ensureContainers(obj.Spec.InitContainers, "/spec/initContainers")...)
+
+	return json.Marshal(ops)
+}
+
+func ensureContainers(cs []corev1.Container, basePath string) []patchOp {
+	var ops []patchOp
+	for i := range cs {
+		// resources
+		if cs[i].Resources.Requests.Cpu().IsZero() {
+			ops = append(ops, patchOp{Op: "add", Path: fmt.Sprintf("%s/%d/resources/requests/cpu", basePath, i), Value: defaultCPURequest})
+		}
+		if cs[i].Resources.Requests.Memory().IsZero() {
+			ops = append(ops, patchOp{Op: "add", Path: fmt.Sprintf("%s/%d/resources/requests/memory", basePath, i), Value: defaultMemRequest})
+		}
+		if cs[i].Resources.Limits.Cpu().IsZero() {
+			ops = append(ops, patchOp{Op: "add", Path: fmt.Sprintf("%s/%d/resources/limits/cpu", basePath, i), Value: defaultCPULimit})
+		}
+		if cs[i].Resources.Limits.Memory().IsZero() {
+			ops = append(ops, patchOp{Op: "add", Path: fmt.Sprintf("%s/%d/resources/limits/memory", basePath, i), Value: defaultMemLimit})
+		}
+		// security defaults
+		scPath := fmt.Sprintf("%s/%d/securityContext", basePath, i)
+		ops = append(ops, patchOp{Op: "add", Path: scPath + "/allowPrivilegeEscalation", Value: false})
+		ops = append(ops, patchOp{Op: "add", Path: scPath + "/capabilities/drop", Value: []string{"ALL"}})
+		ops = append(ops, patchOp{Op: "add", Path: scPath + "/seccompProfile/type", Value: "RuntimeDefault"})
 	}
 	return ops
 }
 
-func hasRequiredLabels(m map[string]string) bool {
-	if m == nil { return false }
-	if m[labelPartOfKey] != labelPartOfValue { return false }
-	if m[labelProjectKey] != labelProjectVal { return false }
-	return true
+func mutateWorkload(raw []byte, kind string) ([]byte, error) {
+	type metaWorkload struct {
+		Metadata metav1.ObjectMeta `json:"metadata"`
+		Spec     struct {
+			Template corev1.PodTemplateSpec `json:"template"`
+		} `json:"spec"`
+	}
+	var wl metaWorkload
+	if err := json.Unmarshal(raw, &wl); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", kind, err)
+	}
+	var ops []patchOp
+
+	if wl.Spec.Template.Labels == nil || wl.Spec.Template.Labels[partOfLabelKey] == "" {
+		ops = append(ops, patchOp{Op: "add", Path: "/spec/template/metadata/labels/" + escape(partOfLabelKey), Value: partOfLabelValue})
+	}
+	if wl.Spec.Template.Labels == nil || wl.Spec.Template.Labels[projectLabelKey] == "" {
+		ops = append(ops, patchOp{Op: "add", Path: "/spec/template/metadata/labels/" + escape(projectLabelKey), Value: projectLabelValue})
+	}
+	ops = append(ops, patchOp{Op: "add", Path: "/spec/template/spec/securityContext/runAsNonRoot", Value: true})
+	ops = append(ops, ensureContainers(wl.Spec.Template.Spec.Containers, "/spec/template/spec/containers")...)
+	ops = append(ops, ensureContainers(wl.Spec.Template.Spec.InitContainers, "/spec/template/spec/initContainers")...)
+
+	return json.Marshal(ops)
 }
 
-func patchResponse(ops []patchOp) *admissionv1.AdmissionResponse {
-	if len(ops) == 0 { return allow("no changes") }
-	b, _ := json.Marshal(ops)
-	t := admissionv1.PatchTypeJSONPatch
-	return &admissionv1.AdmissionResponse{Allowed:true, Patch:b, PatchType:&t}
+func escape(s string) string {
+	return strings.ReplaceAll(s, "/", "~1")
 }
 
-func allow(msg string) *admissionv1.AdmissionResponse {
-	return &admissionv1.AdmissionResponse{Allowed:true, Result:&metav1.Status{Message:msg}}
+// ---------------- VALIDATE ----------------
+
+func handleValidate(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var review admissionv1.AdmissionReview
+	if _, _, err := deserializer.Decode(body, nil, &review); err != nil {
+		http.Error(w, fmt.Sprintf("could not decode request: %v", err), http.StatusBadRequest)
+		return
+	}
+	req := review.Request
+	resp := &admissionv1.AdmissionResponse{UID: req.UID, Allowed: true}
+
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		toError(&review, req.UID, fmt.Errorf("in-cluster config: %w", err))
+		writeReview(w, review)
+		return
+	}
+	client, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		toError(&review, req.UID, fmt.Errorf("clientset: %w", err))
+		writeReview(w, review)
+		return
+	}
+
+	var allErrs field.ErrorList
+
+	switch req.Kind.Kind {
+	case "Pod":
+		allErrs = validatePod(req.Object.Raw, req.Namespace, client)
+	case "Deployment", "StatefulSet", "DaemonSet":
+		allErrs = validateWorkload(req.Object.Raw, req.Kind.Kind, req.Namespace, client)
+	default:
+		// pass-through
+	}
+
+	if len(allErrs) > 0 {
+		resp.Allowed = false
+		resp.Result = &metav1.Status{Message: allErrs.ToAggregate().Error()}
+	}
+	review.Response = resp
+	writeReview(w, review)
 }
 
-func deny(msg string) *admissionv1.AdmissionResponse {
-	return &admissionv1.AdmissionResponse{Allowed:false, Result:&metav1.Status{Reason:metav1.StatusReason(msg)}}
+func validatePod(raw []byte, ns string, cs *kubernetes.Clientset) field.ErrorList {
+	p := &corev1.Pod{}
+	_, _, err := deserializer.Decode(raw, nil, p)
+	if err != nil {
+		return field.ErrorList{field.Invalid(field.NewPath("pod"), "", fmt.Sprintf("decode: %v", err))}
+	}
+	var errs field.ErrorList
+
+	// namespace spójny z etykietą
+	if p.Labels[partOfLabelKey] == partOfLabelValue && ns != free5gcNamespace {
+		errs = append(errs, field.Forbidden(field.NewPath("metadata", "namespace"), fmt.Sprintf("must be %q", free5gcNamespace)))
+	}
+
+	// hostNetwork zakazany
+	if p.Spec.HostNetwork {
+		errs = append(errs, field.Forbidden(field.NewPath("spec", "hostNetwork"), "hostNetwork not allowed"))
+	}
+
+	// kontenery
+	cpath := field.NewPath("spec", "containers")
+	for i := range p.Spec.Containers {
+		errs = append(errs, validateContainer(&p.Spec.Containers[i], cpath.Index(i), ns, cs)...)
+	}
+	icpath := field.NewPath("spec", "initContainers")
+	for i := range p.Spec.InitContainers {
+		errs = append(errs, validateContainer(&p.Spec.InitContainers[i], icpath.Index(i), ns, cs)...)
+	}
+
+	// Multus – weryfikacja IP w DATA_CIDR (best-effort)
+	if nets := p.Annotations["k8s.v1.cni.cncf.io/networks"]; len(nets) > 0 {
+		errs = append(errs, validateNetworks(nets, field.NewPath("metadata", "annotations", "k8s.v1.cni.cncf.io/networks"))...)
+	}
+
+	return errs
 }
 
-func toError(err error) *admissionv1.AdmissionResponse {
-	return &admissionv1.AdmissionResponse{Allowed:false, Result:&metav1.Status{Message:err.Error()}}
+func validateWorkload(raw []byte, kind, ns string, cs *kubernetes.Clientset) field.ErrorList {
+	type metaWorkload struct {
+		Spec struct {
+			Template corev1.PodTemplateSpec `json:"template"`
+		} `json:"spec"`
+	}
+	var wl metaWorkload
+	if err := json.Unmarshal(raw, &wl); err != nil {
+		return field.ErrorList{field.Invalid(field.NewPath(kind), "", fmt.Sprintf("decode: %v", err))}
+	}
+	var errs field.ErrorList
+
+	if wl.Spec.Template.Labels[partOfLabelKey] == partOfLabelValue && ns != free5gcNamespace {
+		errs = append(errs, field.Forbidden(field.NewPath("metadata", "namespace"), fmt.Sprintf("must be %q", free5gcNamespace)))
+	}
+
+	cpath := field.NewPath("spec", "template", "spec", "containers")
+	for i := range wl.Spec.Template.Spec.Containers {
+		errs = append(errs, validateContainer(&wl.Spec.Template.Spec.Containers[i], cpath.Index(i), ns, cs)...)
+	}
+	icpath := field.NewPath("spec", "template", "spec", "initContainers")
+	for i := range wl.Spec.Template.Spec.InitContainers {
+		errs = append(errs, validateContainer(&wl.Spec.Template.Spec.InitContainers[i], icpath.Index(i), ns, cs)...)
+	}
+
+	if wl.Spec.Template.Spec.HostNetwork {
+		errs = append(errs, field.Forbidden(field.NewPath("spec", "template", "spec", "hostNetwork"), "hostNetwork not allowed"))
+	}
+	if nets := wl.Spec.Template.Annotations["k8s.v1.cni.cncf.io/networks"]; len(nets) > 0 {
+		errs = append(errs, validateNetworks(nets, field.NewPath("spec", "template", "metadata", "annotations", "k8s.v1.cni.cncf.io/networks"))...)
+	}
+
+	return errs
 }
 
-func writeReview(w http.ResponseWriter, ar interface{}) {
-	w.Header().Set("Content-Type","application/json")
-	_ = json.NewEncoder(w).Encode(ar)
+func validateContainer(c *corev1.Container, fp *field.Path, ns string, cs *kubernetes.Clientset) field.ErrorList {
+	var errs field.ErrorList
+
+	reqs := c.Resources.Requests
+	lims := c.Resources.Limits
+	if reqs.Cpu().IsZero() || reqs.Memory().IsZero() || lims.Cpu().IsZero() || lims.Memory().IsZero() {
+		errs = append(errs, field.Required(fp.Child("resources"), "requests/limits cpu+memory required"))
+	} else {
+		if lims.Cpu().Cmp(*reqs.Cpu()) < 0 {
+			errs = append(errs, field.Invalid(fp.Child("resources", "limits", "cpu"), lims.Cpu().String(), "must be >= requests.cpu"))
+		}
+		if lims.Memory().Cmp(*reqs.Memory()) < 0 {
+			errs = append(errs, field.Invalid(fp.Child("resources", "limits", "memory"), lims.Memory().String(), "must be >= requests.memory"))
+		}
+	}
+
+	// rejestry i tagi
+	if img := c.Image; img != "" {
+		if denyLatestTag && (strings.HasSuffix(img, ":latest") || !strings.Contains(img, ":")) {
+			errs = append(errs, field.Forbidden(fp.Child("image"), "image tag ':latest' is forbidden; use pinned tag or digest"))
+		}
+		if !isAllowedRegistry(img) {
+			errs = append(errs, field.Forbidden(fp.Child("image"), "image registry not allowed"))
+		}
+	}
+
+	// privileged zakazane
+	if c.SecurityContext != nil && c.SecurityContext.Privileged != nil && *c.SecurityContext.Privileged {
+		errs = append(errs, field.Forbidden(fp.Child("securityContext", "privileged"), "privileged is forbidden"))
+	}
+
+	// NET_ADMIN tylko jeśli ns ma allow-netadmin=true
+	if c.SecurityContext != nil && c.SecurityContext.Capabilities != nil && len(c.SecurityContext.Capabilities.Add) > 0 {
+		for _, cap := range c.SecurityContext.Capabilities.Add {
+			if strings.EqualFold(string(cap), "NET_ADMIN") {
+				ok, err := namespaceAllowsNetAdmin(ns, cs)
+				if err != nil {
+					errs = append(errs, field.Invalid(fp.Child("securityContext", "capabilities", "add"), "NET_ADMIN", fmt.Sprintf("ns check error: %v", err)))
+				} else if !ok {
+					errs = append(errs, field.Forbidden(fp.Child("securityContext", "capabilities", "add"), "NET_ADMIN requires namespace label allow-netadmin=true"))
+				}
+			}
+		}
+	}
+
+	return errs
 }
 
-func getEnv(k, def string) string {
-	if v := os.Getenv(k); v != "" { return v }
-	return def
+func namespaceAllowsNetAdmin(ns string, cs *kubernetes.Clientset) (bool, error) {
+	nso, err := cs.CoreV1().Namespaces().Get(context.Background(), ns, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	return nso.Labels["allow-netadmin"] == "true", nil
+}
+
+var cidrRe = regexp.MustCompile(`"ips"\s*:\s*\[\s*"([^"]+)"`)
+
+func validateNetworks(nets string, fp *field.Path) field.ErrorList {
+	var errs field.ErrorList
+	_, cidrNet, err := net.ParseCIDR(dataPlaneCIDR)
+	if err != nil {
+		return field.ErrorList{field.Invalid(fp, dataPlaneCIDR, "bad DATA_CIDR")}
+	}
+	matches := cidrRe.FindAllStringSubmatch(nets, -1)
+	for _, m := range matches {
+		ipCidr := m[1]
+		ip, _, err := net.ParseCIDR(ipCidr)
+		if err != nil {
+			errs = append(errs, field.Invalid(fp, ipCidr, "not a valid CIDR"))
+			continue
+		}
+		if !cidrNet.Contains(ip) {
+			errs = append(errs, field.Forbidden(fp, fmt.Sprintf("IP %s not in %s", ip.String(), cidrNet.String())))
+		}
+	}
+	return errs
+}
+
+func isAllowedRegistry(image string) bool {
+	// "registry/path:tag" lub "registry/path@sha256:..."
+	reg := image
+	if idx := strings.Index(image, "/"); idx > 0 {
+		reg = image[:idx]
+	}
+	for _, allowed := range allowedRegistries {
+		a := strings.TrimSpace(allowed)
+		if a == "" {
+			continue
+		}
+		if strings.EqualFold(a, reg) || strings.HasPrefix(reg, a) {
+			return true
+		}
+	}
+	return false
 }
