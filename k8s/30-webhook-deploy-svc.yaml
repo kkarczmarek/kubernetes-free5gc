@@ -27,7 +27,7 @@ spec:
     spec:
       containers:
         - name: server
-          image: IMAGE_PLACEHOLDER
+          image: localhost:32000/admission-webhook:0.2.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8443
@@ -43,7 +43,7 @@ spec:
             - name: FREE5GC_NAMESPACE
               value: "free5gc"
             - name: DATA_CIDR
-              value: "10.100.50.0/24"
+              value: "192.168.50.0/24"
             - name: ALLOWED_REGISTRIES
               value: "ghcr.io,public.ecr.aws,docker.io"
             - name: DENY_LATEST_TAG
