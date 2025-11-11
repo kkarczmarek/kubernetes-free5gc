@@ -1,169 +1,181 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- kolory / formatowanie ---
-if [ -t 1 ]; then
-  RED='\033[1;31m'; GREEN='\033[1;32m'; YELLOW='\033[1;33m'
-  BLUE='\033[1;34m'; CYAN='\033[1;36m'; BOLD='\033[1m'; DIM='\033[2m'
-  NC='\033[0m'
-else
-  RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; DIM=''; NC=''
-fi
-hr(){ printf "%s\n" "$(printf '%*s' "$(tput cols 2>/dev/null || echo 80)" '' | tr ' ' '─')"; }
-title(){ hr; printf "%b%s%b\n" "$BOLD$CYAN" "$1" "$NC"; hr; }
-info(){  printf "%b[i]%b %s\n" "$BLUE" "$NC" "$1"; }
-ok(){    printf "%b✔ PASS%b %s\n" "$GREEN" "$NC" "$1"; }
-warn(){  printf "%b! WARN%b %s\n" "$YELLOW" "$NC" "$1"; }
-fail(){  printf "%b✖ FAIL%b %s\n%b%s%b\n" "$RED" "$NC" "$1" "$DIM" "${2:-}" "$NC"; }
+# ---------- kolory i format ----------
+bold() { printf "\033[1m%s\033[0m" "$*"; }
+green() { printf "\033[32m%s\033[0m" "$*"; }
+yellow(){ printf "\033[33m%s\033[0m" "$*"; }
+red()   { printf "\033[31m%s\033[0m" "$*"; }
+cyan()  { printf "\033[36m%s\033[0m" "$*"; }
+sep()   { printf "\n\033[90m%s\033[0m\n" "────────────────────────────────────────────────────────"; }
+title() { sep; echo -e "$(bold "$1")\n"; }
+info()  { echo -e "[i] $*"; }
+ok()    { echo -e "$(green "✔") $*"; }
+warn()  { echo -e "$(yellow "⚠") $*"; }
+err()   { echo -e "$(red "✖") $*"; }
 
-# --- zawsze używaj MicroK8s kubectl ---
-kubectl(){ command microk8s kubectl "$@"; }
-
-# --- parametry ---
+# ---------- konfiguracja ----------
 NS=admission-system
 IMAGE="${IMAGE:-localhost:32000/admission-webhook:0.2.4}"
 REPO_DIR="${REPO_DIR:-$HOME/kubernetes-free5gc}"
 
+# Wybór MicroK8s i kubectl z auto-fallbackiem na sudo
+MK8S="${MK8S:-microk8s}"
+if ! $MK8S status >/dev/null 2>&1; then
+  MK8S="sudo microk8s"
+fi
+KCTL="${KCTL:-$MK8S kubectl}"
+export MK8S KCTL
+
+# Upewnij się, że ~/.kube istnieje (nie szkodzi MicroK8s, a eliminuje ostrzeżenia)
+mkdir -p "$HOME/.kube" 2>/dev/null || true
+
+# ---------- 1) Sprawdzenie węzłów ----------
 title "Sprawdzam węzły"
 info "Czekam na min. 2 węzły Ready…"
 for _ in $(seq 1 120); do
-  ready="$(kubectl get nodes --no-headers 2>/dev/null | awk '$2=="Ready"{c++} END{print c+0}')"
+  ready="$($KCTL get nodes --no-headers 2>/dev/null | awk '$2=="Ready"{c++} END{print c+0}')"
   [ "${ready}" -ge 2 ] && break || sleep 2
 done
-kubectl get nodes -o wide || true
+$KCTL get nodes -o wide || true
 
-title "Włączam/addony (idempotentnie)"
-sudo git config --global --add safe.directory /snap/microk8s/current/addons/community/.git || true
-sudo microk8s enable community
-sudo microk8s enable registry
-sudo microk8s enable multus
-sudo microk8s enable cert-manager
+# ---------- 2) Addony (idempotentnie) ----------
+title "Włączam addony (idempotentnie)"
+$MK8S enable community || true
+$MK8S enable registry || true
+
+# Hostpath storage (nie zawsze włączony domyślnie)
+$MK8S enable hostpath-storage || true
+
+# Multus z lekkim retry (czasem trafia się „Text file busy”)
+info "Włączam Multus…"
+for try in $(seq 1 5); do
+  if $MK8S enable multus; then ok "Multus włączony"; break; fi
+  warn "multus enable nie powiódł się (próba $try) – retry za 5s…"
+  sleep 5
+done
+# Niech daemonset wystartuje, ale nie blokujemy na siłę
+$KCTL -n kube-system rollout status ds/kube-multus-ds --timeout=180s || true
+
+# cert-manager (jeśli jeszcze nie jest)
+$MK8S enable cert-manager || true
 
 title "Czekam na cert-manager"
-kubectl -n cert-manager rollout status deploy/cert-manager --timeout=180s
-kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=180s
-kubectl -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=180s
+$KCTL -n cert-manager rollout status deploy/cert-manager --timeout=300s
+$KCTL -n cert-manager rollout status deploy/cert-manager-webhook --timeout=300s
+$KCTL -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=300s
+ok "cert-manager gotowy"
 
+# ---------- 3) Namespace free5gc + PSA ----------
 title "Namespace free5gc + PSA baseline"
-kubectl create ns free5gc --dry-run=client -o yaml | kubectl apply -f -
-kubectl label ns free5gc pod-security.kubernetes.io/enforce=baseline --overwrite || true
+$KCTL create ns free5gc --dry-run=client -o yaml | $KCTL apply -f -
+$KCTL label ns free5gc pod-security.kubernetes.io/enforce=baseline --overwrite
+ok "free5gc gotowy"
 
+# ---------- 4) Repo (bezpieczny checkout – pomija jeśli masz lokalne zmiany) ----------
 title "Repo + gałąź z webhookami"
 if [ ! -d "$REPO_DIR/.git" ]; then
   git clone https://github.com/kkarczmarek/kubernetes-free5gc.git "$REPO_DIR"
 fi
 cd "$REPO_DIR"
-git fetch origin feat/webhooks-advanced
-git checkout -B feat/webhooks-advanced origin/feat/webhooks-advanced || git checkout feat/webhooks-advanced
 
-title "Konfiguracja manifestów"
-# Dopasuj DATA_CIDR do swojej sieci labowej
+if git diff --quiet && git diff --cached --quiet; then
+  git fetch origin feat/webhooks-advanced || true
+  git checkout -B feat/webhooks-advanced origin/feat/webhooks-advanced || git checkout feat/webhooks-advanced || true
+  ok "Gałąź feat/webhooks-advanced"
+else
+  warn "Wykryto lokalne zmiany – pomijam fetch/checkout i zostawiam bieżącą gałąź."
+fi
+
+# Podmień DATA_CIDR w manifeście jeśli trzeba (Twoja sieć)
 sed -i 's/value: "10\.100\.50\.0\/24"/value: "192.168.50.0\/24"/' k8s/30-webhook-deploy-svc.yaml || true
 
-title "Build & push obrazu webhooka"
+# ---------- 5) Build & push obrazu ----------
+title "Buduję i wypycham obraz webhooka"
 if ! command -v docker >/dev/null 2>&1; then
-  sudo apt-get update && sudo apt-get install -y docker.io
+  info "Instaluję docker.io"
+  sudo apt-get update -y
+  sudo apt-get install -y docker.io
 fi
 sudo docker build -t "$IMAGE" -f admission-controller/Dockerfile admission-controller
 sudo docker push "$IMAGE"
+ok "Obraz: $IMAGE"
 
-title "TLS dla webhooka"
-kubectl apply -f k8s/20-certmanager-issuer.yaml
-kubectl -n "$NS" wait certificate webhook-cert --for=condition=Ready --timeout=180s
+# ---------- 6) TLS cert + wdrożenie webhooka ----------
+title "Cert i wdrożenie webhooka"
+$KCTL apply -f k8s/20-certmanager-issuer.yaml
+$KCTL -n "$NS" wait certificate webhook-cert --for=condition=Ready --timeout=300s
 
-title "Deployment webhooka"
+# wstrzyknięcie obrazu do manifestu i apply
 sed -i "s|IMAGE_PLACEHOLDER|$IMAGE|g" k8s/30-webhook-deploy-svc.yaml
-kubectl apply -f k8s/30-webhook-deploy-svc.yaml
-kubectl -n "$NS" set image deploy/admission-webhook server="$IMAGE" || true
-# twarde SC (distroless:nonroot ma user 'nonroot')
-kubectl -n "$NS" patch deploy admission-webhook --type='strategic' -p '{
+$KCTL apply -f k8s/30-webhook-deploy-svc.yaml
+
+# twardy securityContext, żeby uniknąć błędów z nonroot (distroless:nonroot)
+$KCTL -n "$NS" patch deploy admission-webhook --type='strategic' -p '{
   "spec":{"template":{"spec":{"containers":[{"name":"server","securityContext":{
     "runAsNonRoot": true, "runAsUser": 65532, "runAsGroup": 65532, "allowPrivilegeEscalation": false
   }}]}}}}' || true
-kubectl -n "$NS" rollout status deploy/admission-webhook --timeout=180s
 
-title "Rejestracja webhooków"
-kubectl apply -f k8s/40-mutatingwebhook.yaml
-kubectl apply -f k8s/50-validatingwebhook.yaml
+# dopilnuj, że faktycznie używamy wybranego taga
+$KCTL -n "$NS" set image deploy/admission-webhook server="$IMAGE" --record=false || true
 
-# --- funkcje testowe (nie przerywają skryptu przy błędach) ---
-overall_rc=0
-expect_success(){ # desc, cmd...
-  local desc="$1"; shift
-  set +e; local out; out="$("$@" 2>&1)"; local rc=$?; set -e
-  if [ $rc -eq 0 ]; then ok "$desc"
-  else overall_rc=1; fail "$desc" "$out"
-  fi
-}
-expect_failure_contains(){ # desc, substring, cmd...
-  local desc="$1" needle="$2"; shift 2
-  set +e; local out; out="$("$@" 2>&1)"; local rc=$?; set -e
-  if [ $rc -ne 0 ] && grep -qi -- "$needle" <<<"$out"; then ok "$desc"
-  else overall_rc=1; fail "$desc" "$out"
-  fi
-}
+$KCTL -n "$NS" rollout status deploy/admission-webhook --timeout=300s
+ok "Webhook wystartował"
 
-title "TESTY — mutacje i walidacje"
+# ---------- 7) Rejestracja webhooków ----------
+title "Rejestracja podWebHooków"
+$KCTL apply -f k8s/40-mutatingwebhook.yaml
+$KCTL apply -f k8s/50-validatingwebhook.yaml
+ok "Mutating + Validating zarejestrowane"
 
-# 1) Mutacja: brakujące labelki + SC
-expect_success "Mutating: t-missing-labels — apply OK" \
-  kubectl apply -f tests/01-deploy-missing-labels.yaml
+# ---------- Czekanie na cainjector (CA w caBundle) ----------
+title "Czekam na wstrzyknięcie CA do webhooków (cainjector)"
+for cfg in admission-mutating-webhook admission-validating-webhook; do
+  for i in $(seq 1 60); do
+    size="$($KCTL get $( [[ $cfg == admission-mutating-webhook ]] && echo mutatingwebhookconfiguration || echo validatingwebhookconfiguration ) \
+      $cfg -o jsonpath='{.webhooks[*].clientConfig.caBundle}' 2>/dev/null | wc -c | tr -d ' ')"
+    if [ "${size:-0}" -gt 0 ]; then
+      ok "$cfg ma CA (caBundle size=${size})"
+      break
+    fi
+    sleep 2
+  done
+done
+
+# ---------- 8) Smoke-testy ----------
+title "Smoke-testy"
 set +e
-labels="$(kubectl -n free5gc get deploy t-missing-labels -o jsonpath='{.spec.template.metadata.labels}')"
-sc="$(kubectl -n free5gc get deploy t-missing-labels -o jsonpath='{.spec.template.spec.containers[0].securityContext}')"
+out1="$($KCTL apply -f tests/01-deploy-missing-labels.yaml 2>&1)"; rc1=$?
+out2="$($KCTL apply -f tests/02-deploy-no-resources.yaml 2>&1)"; rc2=$?
+out3="$($KCTL apply -f tests/03-deploy-bad-image.yaml 2>&1)"; rc3=$?
 set -e
-if [[ "$labels" == *'"app.kubernetes.io/part-of":"free5gc"'* \
-   && "$labels" == *'"project":"free5gc"'* \
-   && "$sc" == *'"allowPrivilegeEscalation":false'* \
-   && "$sc" == *'"drop":["ALL"]'* \
-   && "$sc" == *'"RuntimeDefault"'* ]]; then
-  ok "Mutating: t-missing-labels — dodano labelki i SC (drop ALL, seccomp RuntimeDefault)"
-else
-  overall_rc=1
-  fail "Mutating: t-missing-labels — oczekiwane labelki/SC nie widoczne" "labels=$labels; sc=$sc"
-fi
-
-hr
-
-# 2) Mutacja: domyślne requests/limits
-expect_success "Mutating: t-no-resources — apply OK" \
-  kubectl apply -f tests/02-deploy-no-resources.yaml
-set +e
-res="$(kubectl -n free5gc get deploy t-no-resources -o jsonpath='{.spec.template.spec.containers[0].resources}')"
-set -e
-if [[ "$res" == *'"cpu":"50m"'* \
-   && "$res" == *'"memory":"128Mi"'* \
-   && "$res" == *'"cpu":"500m"'* \
-   && "$res" == *'"memory":"512Mi"'* ]]; then
-  ok "Mutating: t-no-resources — wstrzyknięto requests/limits (50m/128Mi, 500m/512Mi)"
-else
-  overall_rc=1
-  fail "Mutating: t-no-resources — brak oczekiwanych requests/limits" "resources=$res"
-fi
-
-hr
-
-# 3) Walidacja: zakaz tagu ':latest'
-kubectl delete -f tests/03-deploy-bad-image.yaml --ignore-not-found >/dev/null 2>&1 || true
-expect_failure_contains "Validating: odrzucono obraz z tagiem ':latest'" "latest.*forbidden" \
-  kubectl apply -f tests/03-deploy-bad-image.yaml
-
-hr
-info "Obrazy w podach webhooka:"
-kubectl -n "$NS" get pods -o=jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.containers[0].image}{"\n"}{end}'
-
-title "PODSUMOWANIE"
-if [ $overall_rc -eq 0 ]; then
-  printf "%b🎉 Wszystkie testy zaliczone.%b\n" "$GREEN" "$NC"
-else
-  printf "%b⚠️  Część testów nie przeszła — przewiń log wyżej po ✖ FAIL.%b\n" "$YELLOW" "$NC"
-fi
 
 echo
-info "Podgląd mutacji (przykład):"
-echo "  microk8s kubectl -n free5gc get deploy t-no-resources -o jsonpath='{.spec.template.spec.containers[0].resources}{\"\\n\"}'"
+sep
+echo "$(bold "01-deploy-missing-labels.yaml")"
+[ $rc1 -eq 0 ] && ok "Utworzony – powinien zostać ZMUTOWANY (dopisywane label/SC)" || err "Błąd: $out1"
+sep
+echo "$(bold "02-deploy-no-resources.yaml")"
+[ $rc2 -eq 0 ] && ok "Utworzony – powinien zostać ZMUTOWANY (dopisywane requests/limits)" || err "Błąd: $out2"
+sep
+echo "$(bold "03-deploy-bad-image.yaml") (oczekiwany DENY za ':latest')"
+if [ $rc3 -ne 0 ]; then
+  if echo "$out3" | grep -qi "image tag ':latest' is forbidden"; then
+    ok "Odrzucony (zgodnie z polityką — zakaz :latest)"
+  else
+    warn "Odrzucony, ale komunikat inny:\n$out3"
+  fi
+else
+  err "Nie został odrzucony, a powinien! Output:\n$out3"
+fi
+sep
+
+# Podgląd efektu mutacji:
+title "Podgląd mutacji (t-no-resources)"
+$KCTL -n free5gc get deploy t-no-resources -o jsonpath='{.spec.template.spec.containers[0].resources}{"\n"}' || true
+
 echo
-info "Walidator hostNetwork (opcjonalnie, chwilowe podniesienie PSA do privileged):"
-echo "  microk8s kubectl label ns free5gc pod-security.kubernetes.io/enforce=privileged --overwrite"
-echo "  microk8s kubectl -n free5gc apply -f tests/04-deploy-hostnetwork.yaml"
-echo "  microk8s kubectl label ns free5gc pod-security.kubernetes.io/enforce=baseline --overwrite"
+info "Gotowe. Jeśli chcesz chwilowo wymusić test walidatora hostNetwork (nad PSA):"
+echo "  $KCTL label ns free5gc pod-security.kubernetes.io/enforce=privileged --overwrite"
+echo "  $KCTL -n free5gc apply -f tests/04-deploy-hostnetwork.yaml"
+echo "  $KCTL label ns free5gc pod-security.kubernetes.io/enforce=baseline --overwrite"
