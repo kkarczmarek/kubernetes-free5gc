@@ -1,15 +1,13 @@
-# Build stage
-FROM golang:1.22 AS builder
+FROM golang:1.22 as build
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod .
 RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/server ./cmd/server
+COPY cmd/server ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/admission-webhook ./cmd/server
 
-# Run stage
 FROM gcr.io/distroless/static:nonroot
-USER nonroot:nonroot
 WORKDIR /
-COPY --from=builder /out/server /server
+USER nonroot:nonroot
+COPY --from=build /out/admission-webhook /admission-webhook
 EXPOSE 8443
-ENTRYPOINT ["/server"]
+ENTRYPOINT ["/admission-webhook"]

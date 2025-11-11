@@ -1,15 +1,15 @@
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
-  name: free5gc-validating
+  name: admission-validating-webhook
   annotations:
-    cert-manager.io/inject-ca-from: admission-system/webhook-tls
+    cert-manager.io/inject-ca-from: admission-system/webhook-cert
 webhooks:
   - name: validate.free5gc.local
     admissionReviewVersions: ["v1"]
     sideEffects: None
     failurePolicy: Fail
-    timeoutSeconds: 5
+    timeoutSeconds: 15
     clientConfig:
       service:
         name: webhook-svc
@@ -21,11 +21,11 @@ webhooks:
           operator: In
           values: ["free5gc"]
     rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE","UPDATE"]
+        resources: ["pods"]
       - apiGroups: ["apps"]
         apiVersions: ["v1"]
         operations: ["CREATE","UPDATE"]
         resources: ["deployments","statefulsets","daemonsets"]
-      - apiGroups: [""]
-        apiVersions: ["v1"]
-        operations: ["CREATE","UPDATE"]
-        resources: ["services","configmaps","secrets"]

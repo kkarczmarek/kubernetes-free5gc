@@ -1,16 +1,16 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: t-missing-labels
+  name: t-no-resources
   namespace: free5gc
+  labels: { app.kubernetes.io/part-of: free5gc }
 spec:
   replicas: 1
-  selector: { matchLabels: { app: t-missing-labels } }
+  selector: { matchLabels: { app: t-no-resources } }
   template:
     metadata:
-      labels: { app: t-missing-labels }
+      labels: { app: t-no-resources, app.kubernetes.io/part-of: free5gc }
     spec:
       containers:
         - name: c
           image: public.ecr.aws/bitnami/nginx:1.25.5
-          resources: {}
