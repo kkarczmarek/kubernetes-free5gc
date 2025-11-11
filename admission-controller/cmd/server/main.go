@@ -20,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	types "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -29,7 +30,6 @@ var (
 	codecs       = serializer.NewCodecFactory(scheme)
 	deserializer = codecs.UniversalDeserializer()
 
-	// domyślne wartości (można nadpisać env w Deployment)
 	defaultCPURequest = getenv("DEFAULT_CPU_REQUEST", "50m")
 	defaultMemRequest = getenv("DEFAULT_MEM_REQUEST", "128Mi")
 	defaultCPULimit   = getenv("DEFAULT_CPU_LIMIT", "500m")
@@ -41,7 +41,7 @@ var (
 	partOfLabelValue  = getenv("PARTOF_LABEL_VALUE", "free5gc")
 
 	free5gcNamespace  = getenv("FREE5GC_NAMESPACE", "free5gc")
-	dataPlaneCIDR     = getenv("DATA_CIDR", "10.100.50.0/24")
+	dataPlaneCIDR     = getenv("DATA_CIDR", "192.168.50.0/24")
 	allowedRegistries = strings.Split(getenv("ALLOWED_REGISTRIES", "ghcr.io,public.ecr.aws,docker.io"), ",")
 
 	denyLatestTag, _ = strconv.ParseBool(getenv("DENY_LATEST_TAG", "true"))
@@ -59,7 +59,7 @@ func writeReview(w http.ResponseWriter, ar admissionv1.AdmissionReview) {
 	_ = json.NewEncoder(w).Encode(ar)
 }
 
-func toError(ar *admissionv1.AdmissionReview, uid string, err error) {
+func toError(ar *admissionv1.AdmissionReview, uid types.UID, err error) {
 	ar.Response = &admissionv1.AdmissionResponse{
 		UID:     uid,
 		Allowed: false,
@@ -103,7 +103,7 @@ func handleMutate(w http.ResponseWriter, r *http.Request) {
 	}
 	var review admissionv1.AdmissionReview
 	if _, _, err := deserializer.Decode(body, nil, &review); err != nil {
-		http.Error(w, fmt.Sprintf("could not decode request: %v", err), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("decode: %v", err), http.StatusBadRequest)
 		return
 	}
 	req := review.Request
@@ -111,8 +111,7 @@ func handleMutate(w http.ResponseWriter, r *http.Request) {
 
 	switch req.Kind.Kind {
 	case "Pod":
-		patch, err := mutatePod(req.Object.Raw)
-		if err != nil {
+		if patch, err := mutatePod(req.Object.Raw); err != nil {
 			toError(&review, req.UID, err)
 		} else if len(patch) > 0 {
 			pt := admissionv1.PatchTypeJSONPatch
@@ -120,16 +119,13 @@ func handleMutate(w http.ResponseWriter, r *http.Request) {
 			resp.Patch = patch
 		}
 	case "Deployment", "StatefulSet", "DaemonSet":
-		patch, err := mutateWorkload(req.Object.Raw, req.Kind.Kind)
-		if err != nil {
+		if patch, err := mutateWorkload(req.Object.Raw, req.Kind.Kind); err != nil {
 			toError(&review, req.UID, err)
 		} else if len(patch) > 0 {
 			pt := admissionv1.PatchTypeJSONPatch
 			resp.PatchType = &pt
 			resp.Patch = patch
 		}
-	default:
-		// pass-through
 	}
 
 	review.Response = resp
@@ -149,17 +145,22 @@ func mutatePod(raw []byte) ([]byte, error) {
 	}
 	var ops []patchOp
 
-	// etykiety
-	if obj.Labels == nil || obj.Labels[partOfLabelKey] == "" {
-		ops = append(ops, patchOp{Op: "add", Path: "/metadata/labels/" + escape(partOfLabelKey), Value: partOfLabelValue})
+	// ensure labels map exists
+	if obj.Labels == nil {
+		ops = append(ops, patchOp{"add", "/metadata/labels", map[string]interface{}{}})
 	}
-	if obj.Labels == nil || obj.Labels[projectLabelKey] == "" {
-		ops = append(ops, patchOp{Op: "add", Path: "/metadata/labels/" + escape(projectLabelKey), Value: projectLabelValue})
+	// labels defaults
+	if obj.Labels[partOfLabelKey] == "" {
+		ops = append(ops, patchOp{"add", "/metadata/labels/" + escape(partOfLabelKey), partOfLabelValue})
+	}
+	if obj.Labels[projectLabelKey] == "" {
+		ops = append(ops, patchOp{"add", "/metadata/labels/" + escape(projectLabelKey), projectLabelValue})
 	}
 
 	// pod-level security
 	if obj.Spec.SecurityContext == nil || obj.Spec.SecurityContext.RunAsNonRoot == nil {
-		ops = append(ops, patchOp{Op: "add", Path: "/spec/securityContext/runAsNonRoot", Value: true})
+		ops = append(ops, patchOp{"add", "/spec/securityContext", map[string]interface{}{}})
+		ops = append(ops, patchOp{"add", "/spec/securityContext/runAsNonRoot", true})
 	}
 
 	// containers + initContainers
@@ -169,35 +170,69 @@ func mutatePod(raw []byte) ([]byte, error) {
 	return json.Marshal(ops)
 }
 
-func ensureContainers(cs []corev1.Container, basePath string) []patchOp {
+func ensureContainers(cs []corev1.Container, base string) []patchOp {
 	var ops []patchOp
 	for i := range cs {
-		// resources
+		scPath := fmt.Sprintf("%s/%d/securityContext", base, i)
+
+		// securityContext {}
+		if cs[i].SecurityContext == nil {
+			ops = append(ops, patchOp{"add", scPath, map[string]interface{}{}})
+		}
+
+		// allowPrivilegeEscalation: false (tylko gdy brak)
+		if cs[i].SecurityContext == nil || cs[i].SecurityContext.AllowPrivilegeEscalation == nil {
+			ops = append(ops, patchOp{"add", scPath + "/allowPrivilegeEscalation", false})
+		}
+
+		// capabilities {} -> drop: ["ALL"] (gdy brak)
+		if cs[i].SecurityContext == nil || cs[i].SecurityContext.Capabilities == nil {
+			ops = append(ops, patchOp{"add", scPath + "/capabilities", map[string]interface{}{}})
+		}
+		if cs[i].SecurityContext == nil || cs[i].SecurityContext.Capabilities == nil || len(cs[i].SecurityContext.Capabilities.Drop) == 0 {
+			ops = append(ops, patchOp{"add", scPath + "/capabilities/drop", []string{"ALL"}})
+		}
+
+		// seccompProfile {} -> type: RuntimeDefault (gdy brak)
+		if cs[i].SecurityContext == nil || cs[i].SecurityContext.SeccompProfile == nil {
+			ops = append(ops, patchOp{"add", scPath + "/seccompProfile", map[string]interface{}{}})
+			ops = append(ops, patchOp{"add", scPath + "/seccompProfile/type", "RuntimeDefault"})
+		} else if cs[i].SecurityContext.SeccompProfile.Type == "" {
+			ops = append(ops, patchOp{"add", scPath + "/seccompProfile/type", "RuntimeDefault"})
+		}
+
+		// resources/requests/limits (utwórz brakujące obiekty)
+		resPath := fmt.Sprintf("%s/%d/resources", base, i)
+		if cs[i].Resources.Requests == nil && cs[i].Resources.Limits == nil {
+			ops = append(ops, patchOp{"add", resPath, map[string]interface{}{}})
+		}
+		if cs[i].Resources.Requests == nil {
+			ops = append(ops, patchOp{"add", resPath + "/requests", map[string]interface{}{}})
+		}
+		if cs[i].Resources.Limits == nil {
+			ops = append(ops, patchOp{"add", resPath + "/limits", map[string]interface{}{}})
+		}
+
+		// domyślne wartości gdy 0
 		if cs[i].Resources.Requests.Cpu().IsZero() {
-			ops = append(ops, patchOp{Op: "add", Path: fmt.Sprintf("%s/%d/resources/requests/cpu", basePath, i), Value: defaultCPURequest})
+			ops = append(ops, patchOp{"add", resPath + "/requests/cpu", defaultCPURequest})
 		}
 		if cs[i].Resources.Requests.Memory().IsZero() {
-			ops = append(ops, patchOp{Op: "add", Path: fmt.Sprintf("%s/%d/resources/requests/memory", basePath, i), Value: defaultMemRequest})
+			ops = append(ops, patchOp{"add", resPath + "/requests/memory", defaultMemRequest})
 		}
 		if cs[i].Resources.Limits.Cpu().IsZero() {
-			ops = append(ops, patchOp{Op: "add", Path: fmt.Sprintf("%s/%d/resources/limits/cpu", basePath, i), Value: defaultCPULimit})
+			ops = append(ops, patchOp{"add", resPath + "/limits/cpu", defaultCPULimit})
 		}
 		if cs[i].Resources.Limits.Memory().IsZero() {
-			ops = append(ops, patchOp{Op: "add", Path: fmt.Sprintf("%s/%d/resources/limits/memory", basePath, i), Value: defaultMemLimit})
+			ops = append(ops, patchOp{"add", resPath + "/limits/memory", defaultMemLimit})
 		}
-		// security defaults
-		scPath := fmt.Sprintf("%s/%d/securityContext", basePath, i)
-		ops = append(ops, patchOp{Op: "add", Path: scPath + "/allowPrivilegeEscalation", Value: false})
-		ops = append(ops, patchOp{Op: "add", Path: scPath + "/capabilities/drop", Value: []string{"ALL"}})
-		ops = append(ops, patchOp{Op: "add", Path: scPath + "/seccompProfile/type", Value: "RuntimeDefault"})
 	}
 	return ops
 }
 
 func mutateWorkload(raw []byte, kind string) ([]byte, error) {
 	type metaWorkload struct {
-		Metadata metav1.ObjectMeta `json:"metadata"`
-		Spec     struct {
+		Spec struct {
 			Template corev1.PodTemplateSpec `json:"template"`
 		} `json:"spec"`
 	}
@@ -207,13 +242,22 @@ func mutateWorkload(raw []byte, kind string) ([]byte, error) {
 	}
 	var ops []patchOp
 
-	if wl.Spec.Template.Labels == nil || wl.Spec.Template.Labels[partOfLabelKey] == "" {
-		ops = append(ops, patchOp{Op: "add", Path: "/spec/template/metadata/labels/" + escape(partOfLabelKey), Value: partOfLabelValue})
+	// ensure labels map exists
+	if wl.Spec.Template.Labels == nil {
+		ops = append(ops, patchOp{"add", "/spec/template/metadata/labels", map[string]interface{}{}})
 	}
-	if wl.Spec.Template.Labels == nil || wl.Spec.Template.Labels[projectLabelKey] == "" {
-		ops = append(ops, patchOp{Op: "add", Path: "/spec/template/metadata/labels/" + escape(projectLabelKey), Value: projectLabelValue})
+	// label defaults
+	if wl.Spec.Template.Labels[partOfLabelKey] == "" {
+		ops = append(ops, patchOp{"add", "/spec/template/metadata/labels/" + escape(partOfLabelKey), partOfLabelValue})
 	}
-	ops = append(ops, patchOp{Op: "add", Path: "/spec/template/spec/securityContext/runAsNonRoot", Value: true})
+	if wl.Spec.Template.Labels[projectLabelKey] == "" {
+		ops = append(ops, patchOp{"add", "/spec/template/metadata/labels/" + escape(projectLabelKey), projectLabelValue})
+	}
+	// pod security default
+	if wl.Spec.Template.Spec.SecurityContext == nil || wl.Spec.Template.Spec.SecurityContext.RunAsNonRoot == nil {
+		ops = append(ops, patchOp{"add", "/spec/template/spec/securityContext", map[string]interface{}{}})
+		ops = append(ops, patchOp{"add", "/spec/template/spec/securityContext/runAsNonRoot", true})
+	}
 	ops = append(ops, ensureContainers(wl.Spec.Template.Spec.Containers, "/spec/template/spec/containers")...)
 	ops = append(ops, ensureContainers(wl.Spec.Template.Spec.InitContainers, "/spec/template/spec/initContainers")...)
 
@@ -234,7 +278,7 @@ func handleValidate(w http.ResponseWriter, r *http.Request) {
 	}
 	var review admissionv1.AdmissionReview
 	if _, _, err := deserializer.Decode(body, nil, &review); err != nil {
-		http.Error(w, fmt.Sprintf("could not decode request: %v", err), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("decode: %v", err), http.StatusBadRequest)
 		return
 	}
 	req := review.Request
@@ -260,8 +304,6 @@ func handleValidate(w http.ResponseWriter, r *http.Request) {
 		allErrs = validatePod(req.Object.Raw, req.Namespace, client)
 	case "Deployment", "StatefulSet", "DaemonSet":
 		allErrs = validateWorkload(req.Object.Raw, req.Kind.Kind, req.Namespace, client)
-	default:
-		// pass-through
 	}
 
 	if len(allErrs) > 0 {
@@ -280,17 +322,14 @@ func validatePod(raw []byte, ns string, cs *kubernetes.Clientset) field.ErrorLis
 	}
 	var errs field.ErrorList
 
-	// namespace spójny z etykietą
 	if p.Labels[partOfLabelKey] == partOfLabelValue && ns != free5gcNamespace {
 		errs = append(errs, field.Forbidden(field.NewPath("metadata", "namespace"), fmt.Sprintf("must be %q", free5gcNamespace)))
 	}
 
-	// hostNetwork zakazany
 	if p.Spec.HostNetwork {
 		errs = append(errs, field.Forbidden(field.NewPath("spec", "hostNetwork"), "hostNetwork not allowed"))
 	}
 
-	// kontenery
 	cpath := field.NewPath("spec", "containers")
 	for i := range p.Spec.Containers {
 		errs = append(errs, validateContainer(&p.Spec.Containers[i], cpath.Index(i), ns, cs)...)
@@ -300,7 +339,6 @@ func validatePod(raw []byte, ns string, cs *kubernetes.Clientset) field.ErrorLis
 		errs = append(errs, validateContainer(&p.Spec.InitContainers[i], icpath.Index(i), ns, cs)...)
 	}
 
-	// Multus – weryfikacja IP w DATA_CIDR (best-effort)
 	if nets := p.Annotations["k8s.v1.cni.cncf.io/networks"]; len(nets) > 0 {
 		errs = append(errs, validateNetworks(nets, field.NewPath("metadata", "annotations", "k8s.v1.cni.cncf.io/networks"))...)
 	}
@@ -359,7 +397,6 @@ func validateContainer(c *corev1.Container, fp *field.Path, ns string, cs *kuber
 		}
 	}
 
-	// rejestry i tagi
 	if img := c.Image; img != "" {
 		if denyLatestTag && (strings.HasSuffix(img, ":latest") || !strings.Contains(img, ":")) {
 			errs = append(errs, field.Forbidden(fp.Child("image"), "image tag ':latest' is forbidden; use pinned tag or digest"))
@@ -369,12 +406,10 @@ func validateContainer(c *corev1.Container, fp *field.Path, ns string, cs *kuber
 		}
 	}
 
-	// privileged zakazane
 	if c.SecurityContext != nil && c.SecurityContext.Privileged != nil && *c.SecurityContext.Privileged {
 		errs = append(errs, field.Forbidden(fp.Child("securityContext", "privileged"), "privileged is forbidden"))
 	}
 
-	// NET_ADMIN tylko jeśli ns ma allow-netadmin=true
 	if c.SecurityContext != nil && c.SecurityContext.Capabilities != nil && len(c.SecurityContext.Capabilities.Add) > 0 {
 		for _, cap := range c.SecurityContext.Capabilities.Add {
 			if strings.EqualFold(string(cap), "NET_ADMIN") {
@@ -423,7 +458,6 @@ func validateNetworks(nets string, fp *field.Path) field.ErrorList {
 }
 
 func isAllowedRegistry(image string) bool {
-	// "registry/path:tag" lub "registry/path@sha256:..."
 	reg := image
 	if idx := strings.Index(image, "/"); idx > 0 {
 		reg = image[:idx]
