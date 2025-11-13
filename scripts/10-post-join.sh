@@ -27,7 +27,6 @@ fi
 KCTL="${KCTL:-$MK8S kubectl}"
 export MK8S KCTL
 
-# Upewnij się, że ~/.kube istnieje (nie szkodzi MicroK8s, a eliminuje ostrzeżenia)
 mkdir -p "$HOME/.kube" 2>/dev/null || true
 
 # ---------- 1) Sprawdzenie węzłów ----------
@@ -47,17 +46,16 @@ $MK8S enable registry || true
 # Hostpath storage (nie zawsze włączony domyślnie)
 $MK8S enable hostpath-storage || true
 
-# Multus z lekkim retry (czasem trafia się „Text file busy”)
+# Multus z retry (wymaga czasu)
 info "Włączam Multus…"
 for try in $(seq 1 5); do
   if $MK8S enable multus; then ok "Multus włączony"; break; fi
   warn "multus enable nie powiódł się (próba $try) – retry za 5s…"
   sleep 5
 done
-# Niech daemonset wystartuje, ale nie blokujemy na siłę
+# Oczekiwanie na start daemonset
 $KCTL -n kube-system rollout status ds/kube-multus-ds --timeout=180s || true
 
-# cert-manager (jeśli jeszcze nie jest)
 $MK8S enable cert-manager || true
 
 title "Czekam na cert-manager"
@@ -72,7 +70,7 @@ $KCTL create ns free5gc --dry-run=client -o yaml | $KCTL apply -f -
 $KCTL label ns free5gc pod-security.kubernetes.io/enforce=baseline --overwrite
 ok "free5gc gotowy"
 
-# ---------- 4) Repo (bezpieczny checkout – pomija jeśli masz lokalne zmiany) ----------
+# ---------- 4) Repo (bezpieczny checkout – pomija jeśli sa lokalne zmiany) ----------
 title "Repo + gałąź z webhookami"
 if [ ! -d "$REPO_DIR/.git" ]; then
   git clone https://github.com/kkarczmarek/kubernetes-free5gc.git "$REPO_DIR"
