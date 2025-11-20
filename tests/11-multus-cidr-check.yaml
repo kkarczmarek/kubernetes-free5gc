@@ -1,0 +1,41 @@
+# WERSJA ZŁA (poza DATA_CIDR=192.168.50.0/24) -> DENY
+apiVersion: v1
+kind: Pod
+metadata:
+  name: t-deny-multus-ip-outside
+  namespace: playground
+  annotations:
+    k8s.v1.cni.cncf.io/networks: |
+      [{
+        "name": "net-foo",
+        "ips": ["10.10.10.10/24"]
+      }]
+spec:
+  containers:
+    - name: c
+      image: docker.io/library/busybox:1.36.1
+      command: ["sh","-c","sleep 5"]
+      resources:
+        requests: {cpu: "50m", memory: "64Mi"}
+        limits:   {cpu: "100m", memory: "128Mi"}
+---
+# WERSJA DOBRA (w DATA_CIDR) -> ALLOW
+apiVersion: v1
+kind: Pod
+metadata:
+  name: t-allow-multus-ip-inside
+  namespace: playground
+  annotations:
+    k8s.v1.cni.cncf.io/networks: |
+      [{
+        "name": "net-bar",
+        "ips": ["192.168.50.10/24"]
+      }]
+spec:
+  containers:
+    - name: c
+      image: docker.io/library/busybox:1.36.1
+      command: ["sh","-c","sleep 5"]
+      resources:
+        requests: {cpu: "50m", memory: "64Mi"}
+        limits:   {cpu: "100m", memory: "128Mi"}
