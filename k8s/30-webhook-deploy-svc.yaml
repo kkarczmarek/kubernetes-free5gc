@@ -20,7 +20,7 @@ spec:
         runAsNonRoot: true
       containers:
         - name: webhook
-          image: ghcr.io/kkarczmarek/admission-webhook:latest   # <- podmień na właściwy tag z GH Actions
+          image: ghcr.io/kkarczmarek/admission-webhook:latest   # <- tu możesz podmienić na lokalny registry lub konkretny tag
           imagePullPolicy: IfNotPresent
           args: []
           ports:
@@ -71,6 +71,8 @@ spec:
             initialDelaySeconds: 3
             periodSeconds: 5
           securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
