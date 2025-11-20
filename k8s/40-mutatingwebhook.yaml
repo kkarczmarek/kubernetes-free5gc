@@ -16,7 +16,7 @@ webhooks:
       matchExpressions:
         - key: kubernetes.io/metadata.name
           operator: NotIn
-          values: ["admission-system"]     # nie mutuj samego webhooka
+          values: ["admission-system"]     # zeby nie mutowac samego webhooka
     clientConfig:
       service:
         namespace: admission-system
