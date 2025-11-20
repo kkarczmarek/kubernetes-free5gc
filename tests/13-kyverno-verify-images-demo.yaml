@@ -1,0 +1,26 @@
+# Najpierw ustaw politykę kyverno na Audit albo skonfiguruj cosign secret (policies/kyverno-verify-images.yaml)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: t-unsigned-image
+  namespace: playground
+spec:
+  containers:
+    - name: c
+      image: docker.io/library/nginx:1.25.4   # prawdopodobnie niesygnowany -> DENY po włączeniu Cosign
+      resources:
+        requests: {cpu: "50m", memory: "64Mi"}
+        limits:   {cpu: "100m", memory: "128Mi"}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: t-signed-image
+  namespace: playground
+spec:
+  containers:
+    - name: c
+      image: ghcr.io/your-org/signed-demo:1.0.0  # przykład: obraz podpisany Twoim kluczem -> ALLOW
+      resources:
+        requests: {cpu: "50m", memory: "64Mi"}
+        limits:   {cpu: "100m", memory: "128Mi"}
