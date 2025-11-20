@@ -1,22 +1,30 @@
+# Umieść publiczny klucz Cosign w Secret:
+# kubectl -n kyverno create secret generic cosign-pub --from-file=cosign.pub=./cosign.pub
+---
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
-  name: verify-signed-images
+  name: verify-images-cosign
 spec:
   validationFailureAction: Enforce
+  background: false
   rules:
-  - name: require-signed
-    match:
-      any:
-      - resources:
-          kinds: ["Pod","Deployment","StatefulSet","DaemonSet","Job","CronJob"]
-          namespaces: ["free5gc"]
-    verifyImages:
-    - image: "*"
-      attestors:
-      - entries:
-        - keys:
-            publicKeys: |-
-              -----BEGIN PUBLIC KEY-----
-              # TODO: wstaw klucz Cosign / Sigstore
-              -----END PUBLIC KEY-----
+    - name: require-signed-images
+      match:
+        any:
+          - resources:
+              kinds: ["Pod","Deployment","StatefulSet","DaemonSet","Job","CronJob"]
+              namespaces:
+                - free5gc
+                - playground
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/*"
+            - "public.ecr.aws/*"
+          attestors:
+            - entries:
+                - keys:
+                    secret:
+                      name: cosign-pub
+                      namespace: kyverno
+          failureAction: Enforce
