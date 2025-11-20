@@ -1,0 +1,22 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-apiserver-to-webhook
+  namespace: admission-system
+spec:
+  podSelector:
+    matchLabels:
+      app: admission-webhook
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchExpressions:
+              - { key: component, operator: In, values: ["kube-apiserver"] }
+              - { key: k8s-app, operator: In, values: ["kube-apiserver"] }
+      ports:
+        - port: 8443
+          protocol: TCP
