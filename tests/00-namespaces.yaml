@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: playground
+  labels:
+    pod-security.kubernetes.io/enforce: "restricted"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: free5gc
+  labels:
+    pod-security.kubernetes.io/enforce: "restricted"
