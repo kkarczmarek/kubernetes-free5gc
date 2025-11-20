@@ -26,9 +26,9 @@ import (
 )
 
 var (
-	scheme       = runtime.NewScheme()
-	codecs       = serializer.NewCodecFactory(scheme)
-	deserializer = codecs.UniversalDeserializer()
+	scheme       = runtime.NewScheme() // rejestr typow k8s
+	codecs       = serializer.NewCodecFactory(scheme) // kodowanie API
+	deserializer = codecs.UniversalDeserializer() // dekodowanie
 
 	defaultCPURequest = getenv("DEFAULT_CPU_REQUEST", "50m")
 	defaultMemRequest = getenv("DEFAULT_MEM_REQUEST", "128Mi")
@@ -55,8 +55,8 @@ func getenv(k, def string) string {
 }
 
 func writeReview(w http.ResponseWriter, ar admissionv1.AdmissionReview) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(ar)
+	w.Header().Set("Content-Type", "application/json") // ustawia naglowek
+	_ = json.NewEncoder(w).Encode(ar) // do JSON i wysyla do API
 }
 
 func toError(ar *admissionv1.AdmissionReview, uid types.UID, err error) {
@@ -66,7 +66,7 @@ func toError(ar *admissionv1.AdmissionReview, uid types.UID, err error) {
 		Result:  &metav1.Status{Message: err.Error()},
 	}
 }
-
+// start serwera webhooka
 func main() {
 	certFile := getenv("TLS_CERT_FILE", "/tls/tls.crt")
 	keyFile := getenv("TLS_KEY_FILE", "/tls/tls.key")
@@ -94,7 +94,7 @@ func main() {
 }
 
 // ---------------- MUTATE ----------------
-
+// czyta JSON z AdmissionReview
 func handleMutate(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -145,11 +145,11 @@ func mutatePod(raw []byte) ([]byte, error) {
 	}
 	var ops []patchOp
 
-	// ensure labels map exists
+	// dodanie pustej mapy
 	if obj.Labels == nil {
 		ops = append(ops, patchOp{"add", "/metadata/labels", map[string]interface{}{}})
 	}
-	// labels defaults
+	// wartosci defaultowe
 	if obj.Labels[partOfLabelKey] == "" {
 		ops = append(ops, patchOp{"add", "/metadata/labels/" + escape(partOfLabelKey), partOfLabelValue})
 	}
@@ -157,7 +157,7 @@ func mutatePod(raw []byte) ([]byte, error) {
 		ops = append(ops, patchOp{"add", "/metadata/labels/" + escape(projectLabelKey), projectLabelValue})
 	}
 
-	// pod-level security
+	// dodaje pusty obiekt SecurityContext i ustawia true
 	if obj.Spec.SecurityContext == nil || obj.Spec.SecurityContext.RunAsNonRoot == nil {
 		ops = append(ops, patchOp{"add", "/spec/securityContext", map[string]interface{}{}})
 		ops = append(ops, patchOp{"add", "/spec/securityContext/runAsNonRoot", true})
@@ -166,10 +166,10 @@ func mutatePod(raw []byte) ([]byte, error) {
 	// containers + initContainers
 	ops = append(ops, ensureContainers(obj.Spec.Containers, "/spec/containers")...)
 	ops = append(ops, ensureContainers(obj.Spec.InitContainers, "/spec/initContainers")...)
-
+	// zmiana slice ops na JSON
 	return json.Marshal(ops)
 }
-
+// lista kontenerow i sciezka do securityContext
 func ensureContainers(cs []corev1.Container, base string) []patchOp {
 	var ops []patchOp
 	for i := range cs {
@@ -201,7 +201,7 @@ func ensureContainers(cs []corev1.Container, base string) []patchOp {
 			ops = append(ops, patchOp{"add", scPath + "/seccompProfile/type", "RuntimeDefault"})
 		}
 
-		// resources/requests/limits (utwórz brakujące obiekty)
+		// resources/requests/limits (tworzy brakujące obiekty)
 		resPath := fmt.Sprintf("%s/%d/resources", base, i)
 		if cs[i].Resources.Requests == nil && cs[i].Resources.Limits == nil {
 			ops = append(ops, patchOp{"add", resPath, map[string]interface{}{}})
@@ -242,18 +242,18 @@ func mutateWorkload(raw []byte, kind string) ([]byte, error) {
 	}
 	var ops []patchOp
 
-	// ensure labels map exists
+	// dodanie pustej mapy
 	if wl.Spec.Template.Labels == nil {
 		ops = append(ops, patchOp{"add", "/spec/template/metadata/labels", map[string]interface{}{}})
 	}
-	// label defaults
+	// wartosci domyslne
 	if wl.Spec.Template.Labels[partOfLabelKey] == "" {
 		ops = append(ops, patchOp{"add", "/spec/template/metadata/labels/" + escape(partOfLabelKey), partOfLabelValue})
 	}
 	if wl.Spec.Template.Labels[projectLabelKey] == "" {
 		ops = append(ops, patchOp{"add", "/spec/template/metadata/labels/" + escape(projectLabelKey), projectLabelValue})
 	}
-	// pod security default
+	// wartosci domyslne
 	if wl.Spec.Template.Spec.SecurityContext == nil || wl.Spec.Template.Spec.SecurityContext.RunAsNonRoot == nil {
 		ops = append(ops, patchOp{"add", "/spec/template/spec/securityContext", map[string]interface{}{}})
 		ops = append(ops, patchOp{"add", "/spec/template/spec/securityContext/runAsNonRoot", true})
@@ -409,7 +409,7 @@ func validateContainer(c *corev1.Container, fp *field.Path, ns string, cs *kuber
 	if c.SecurityContext != nil && c.SecurityContext.Privileged != nil && *c.SecurityContext.Privileged {
 		errs = append(errs, field.Forbidden(fp.Child("securityContext", "privileged"), "privileged is forbidden"))
 	}
-
+	// jesli kontener ma capabilities do dodania sprawdza, jesli NET_ADMIN i brak allow-netadmin=true odrzuca
 	if c.SecurityContext != nil && c.SecurityContext.Capabilities != nil && len(c.SecurityContext.Capabilities.Add) > 0 {
 		for _, cap := range c.SecurityContext.Capabilities.Add {
 			if strings.EqualFold(string(cap), "NET_ADMIN") {
@@ -433,7 +433,7 @@ func namespaceAllowsNetAdmin(ns string, cs *kubernetes.Clientset) (bool, error) 
 	}
 	return nso.Labels["allow-netadmin"] == "true", nil
 }
-
+// do IP multusa
 var cidrRe = regexp.MustCompile(`"ips"\s*:\s*\[\s*"([^"]+)"`)
 
 func validateNetworks(nets string, fp *field.Path) field.ErrorList {
@@ -456,7 +456,7 @@ func validateNetworks(nets string, fp *field.Path) field.ErrorList {
 	}
 	return errs
 }
-
+// sprawdzenie rejestru obrazu (iteracja po liscie)
 func isAllowedRegistry(image string) bool {
 	reg := image
 	if idx := strings.Index(image, "/"); idx > 0 {
