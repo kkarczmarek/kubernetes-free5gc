@@ -1,31 +1,34 @@
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
-  name: admission-mutating-webhook
+  name: admission-webhook-mutating
   annotations:
-    cert-manager.io/inject-ca-from: admission-system/webhook-cert
+    cert-manager.io/inject-ca-from: admission-system/admission-webhook-serving-cert
 webhooks:
-  - name: mutate.free5gc.local
+  - name: labels-and-security.mutator.kkarczmarek.dev
     admissionReviewVersions: ["v1"]
     sideEffects: None
-    failurePolicy: Ignore
+    reinvocationPolicy: IfNeeded
     timeoutSeconds: 10
-    clientConfig:
-      service:
-        name: webhook-svc
-        namespace: admission-system
-        path: /mutate
+    failurePolicy: Fail
+    matchPolicy: Equivalent
     namespaceSelector:
       matchExpressions:
         - key: kubernetes.io/metadata.name
-          operator: In
-          values: ["free5gc"]
+          operator: NotIn
+          values: ["admission-system"]     # nie mutuj samego webhooka
+    clientConfig:
+      service:
+        namespace: admission-system
+        name: admission-webhook-svc
+        path: /mutate
+        port: 443
     rules:
-      - apiGroups: [""]
+      - operations: ["CREATE","UPDATE"]
+        apiGroups: [""]
         apiVersions: ["v1"]
-        operations: ["CREATE","UPDATE"]
         resources: ["pods"]
-      - apiGroups: ["apps"]
+      - operations: ["CREATE","UPDATE"]
+        apiGroups: ["apps"]
         apiVersions: ["v1"]
-        operations: ["CREATE","UPDATE"]
         resources: ["deployments","statefulsets","daemonsets"]
