@@ -20,7 +20,7 @@ spec:
         runAsNonRoot: true
       containers:
         - name: webhook
-          image: ghcr.io/kkarczmarek/admission-webhook:latest   # <- tu możesz podmienić na lokalny registry lub konkretny tag
+          image: localhost:32000/admission-webhook:0.1.0
           imagePullPolicy: IfNotPresent
           args: []
           ports:
