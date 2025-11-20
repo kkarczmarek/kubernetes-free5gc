@@ -1,0 +1,14 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: admission-webhook-serving-cert
+  namespace: admission-system
+spec:
+  secretName: admission-webhook-tls
+  issuerRef:
+    name: admission-selfsigned-issuer
+    kind: Issuer
+  commonName: admission-webhook-svc.admission-system.svc
+  dnsNames:
+    - admission-webhook-svc.admission-system.svc
+    - admission-webhook-svc.admission-system.svc.cluster.local
