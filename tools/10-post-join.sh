@@ -24,7 +24,7 @@ helm repo add jetstack https://charts.jetstack.io >/dev/null
 helm repo update >/dev/null
 helm upgrade --install cert-manager jetstack/cert-manager \
   --namespace cert-manager --create-namespace \
-  --set crds.install=true
+  --set crds.enabled=true
 
 echo "[21] Czekam na gotowość cert-manager…"
 "$KUBECTL" -n cert-manager rollout status deploy/cert-manager-webhook --timeout=180s || true
