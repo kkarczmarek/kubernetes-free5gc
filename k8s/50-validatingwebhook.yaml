@@ -9,13 +9,11 @@ webhooks:
     admissionReviewVersions: ["v1"]
     sideEffects: None
     timeoutSeconds: 10
-    failurePolicy: Fail
+    failurePolicy: Ignore
     matchPolicy: Equivalent
     namespaceSelector:
-      matchExpressions:
-        - key: kubernetes.io/metadata.name
-          operator: NotIn
-          values: ["admission-system"]
+      matchLabels:
+        admission.kkarczmarek.dev/enabled: "true"
     clientConfig:
       service:
         namespace: admission-system

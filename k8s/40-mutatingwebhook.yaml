@@ -10,13 +10,11 @@ webhooks:
     sideEffects: None
     reinvocationPolicy: IfNeeded
     timeoutSeconds: 10
-    failurePolicy: Fail
+    failurePolicy: Ignore
     matchPolicy: Equivalent
     namespaceSelector:
-      matchExpressions:
-        - key: kubernetes.io/metadata.name
-          operator: NotIn
-          values: ["admission-system"]     # zeby nie mutowac samego webhooka
+      matchLabels:
+        admission.kkarczmarek.dev/enabled: "true"
     clientConfig:
       service:
         namespace: admission-system

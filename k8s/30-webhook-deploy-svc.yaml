@@ -20,7 +20,7 @@ spec:
         runAsNonRoot: true
       containers:
         - name: webhook
-          image: localhost:32000/admission-webhook:0.1.0
+          image: localhost:32000/admission-webhook:0.1.1   # <- podmień na właściwy tag z GH Actions
           imagePullPolicy: IfNotPresent
           args: []
           ports:
@@ -47,11 +47,13 @@ spec:
             - name: FREE5GC_NAMESPACE
               value: "free5gc"
             - name: DATA_CIDR
-              value: "192.168.50.0/24"
+              value: "10.100.0.0/16"
             - name: ALLOWED_REGISTRIES
-              value: "ghcr.io,public.ecr.aws,docker.io"
+              value: "ghcr.io,public.ecr.aws,docker.io,towards5gs,free5gc,quay.io"
             - name: DENY_LATEST_TAG
-              value: "true"
+              value: "false"
+            - name: TCPDUMP_IMAGE
+              value: "docker.io/corfr/tcpdump:latest"
           volumeMounts:
             - name: tls
               mountPath: /tls
@@ -71,8 +73,6 @@ spec:
             initialDelaySeconds: 3
             periodSeconds: 5
           securityContext:
-            runAsNonRoot: true
-            runAsUser: 65532
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]

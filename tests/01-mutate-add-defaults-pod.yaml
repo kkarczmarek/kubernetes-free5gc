@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: t-mutate-add-defaults
-  namespace: playground
+  namespace: free5gc
 spec:
   containers:
     - name: pause

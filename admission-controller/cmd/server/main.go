@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -26,9 +25,9 @@ import (
 )
 
 var (
-	scheme       = runtime.NewScheme() // rejestr typow k8s
-	codecs       = serializer.NewCodecFactory(scheme) // kodowanie API
-	deserializer = codecs.UniversalDeserializer() // dekodowanie
+	scheme       = runtime.NewScheme()
+	codecs       = serializer.NewCodecFactory(scheme)
+	deserializer = codecs.UniversalDeserializer()
 
 	defaultCPURequest = getenv("DEFAULT_CPU_REQUEST", "50m")
 	defaultMemRequest = getenv("DEFAULT_MEM_REQUEST", "128Mi")
@@ -44,8 +43,11 @@ var (
 	dataPlaneCIDR     = getenv("DATA_CIDR", "192.168.50.0/24")
 	allowedRegistries = strings.Split(getenv("ALLOWED_REGISTRIES", "ghcr.io,public.ecr.aws,docker.io"), ",")
 
-	denyLatestTag, _ = strconv.ParseBool(getenv("DENY_LATEST_TAG", "true"))
+	denyLatestTag   = getenv("DENY_LATEST_TAG", "true") == "true"
+	tcpdumpImage     = getenv("TCPDUMP_IMAGE", "docker.io/corfr/tcpdump:latest")
 )
+
+const tcpdumpContainerName = "tcpdump-sidecar"
 
 func getenv(k, def string) string {
 	if v := os.Getenv(k); v != "" {
@@ -54,9 +56,15 @@ func getenv(k, def string) string {
 	return def
 }
 
+func sanitizeLabelValue(v string) string {
+    // K8s label value nie może mieć '/', więc zamieniamy go na '-'.
+    // Przykład: "10.60.0.0/24" -> "10.60.0.0-24"
+    return strings.ReplaceAll(v, "/", "-")
+}
+
 func writeReview(w http.ResponseWriter, ar admissionv1.AdmissionReview) {
-	w.Header().Set("Content-Type", "application/json") // ustawia naglowek
-	_ = json.NewEncoder(w).Encode(ar) // do JSON i wysyla do API
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(ar)
 }
 
 func toError(ar *admissionv1.AdmissionReview, uid types.UID, err error) {
@@ -66,7 +74,7 @@ func toError(ar *admissionv1.AdmissionReview, uid types.UID, err error) {
 		Result:  &metav1.Status{Message: err.Error()},
 	}
 }
-// start serwera webhooka
+
 func main() {
 	certFile := getenv("TLS_CERT_FILE", "/tls/tls.crt")
 	keyFile := getenv("TLS_KEY_FILE", "/tls/tls.key")
@@ -94,7 +102,7 @@ func main() {
 }
 
 // ---------------- MUTATE ----------------
-// czyta JSON z AdmissionReview
+
 func handleMutate(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -138,6 +146,70 @@ type patchOp struct {
 	Value interface{} `json:"value,omitempty"`
 }
 
+func mutatePodWithTcpdump(pod *corev1.Pod, ops []patchOp) []patchOp {
+	// Używamy isUpfPodTemplate, ale "opakowujemy" Pod w PodTemplateSpec
+	template := &corev1.PodTemplateSpec{
+		ObjectMeta: pod.ObjectMeta,
+		Spec:       pod.Spec,
+	}
+
+	if !isUpfPodTemplate(template) {
+		return ops
+	}
+
+	annPath := "/metadata/annotations"
+
+	// Upewniamy się, że anotacje istnieją
+	if pod.Annotations == nil {
+		ops = append(ops, patchOp{
+			Op:    "add",
+			Path:  annPath,
+			Value: map[string]interface{}{},
+		})
+	}
+
+	// Włączanie tcpdumpa tylko jeśli explicite ustawiono flagę
+	if pod.Annotations["5g.kkarczmarek.dev/tcpdump-enabled"] != "true" {
+		return ops
+	}
+
+	// Jeśli ten Pod nie ma jeszcze sidecara, wstrzykujemy go
+	if !hasTcpdumpContainer(&pod.Spec) {
+		sidecar := buildTcpdumpContainer(pod.Annotations)
+
+		volPath := "/spec/volumes"
+
+		// jeśli nie ma volumes, dodajemy pustą listę
+		if len(pod.Spec.Volumes) == 0 {
+			ops = append(ops, patchOp{
+				Op:    "add",
+				Path:  volPath,
+				Value: []interface{}{},
+			})
+		}
+
+		// dodajemy kontener tcpdump-sidecar na końcu listy containers
+		ops = append(ops, patchOp{
+			Op:    "add",
+			Path:  "/spec/containers/-",
+			Value: sidecar,
+		})
+
+		// i volume typu emptyDir na dane tcpdumpa
+		tcpdumpVol := map[string]interface{}{
+			"name": "tcpdump-data",
+			"emptyDir": map[string]interface{}{},
+		}
+		ops = append(ops, patchOp{
+			Op:    "add",
+			Path:  volPath + "/-",
+			Value: tcpdumpVol,
+		})
+	}
+
+	return ops
+}
+
 func mutatePod(raw []byte) ([]byte, error) {
 	obj := &corev1.Pod{}
 	if _, _, err := deserializer.Decode(raw, nil, obj); err != nil {
@@ -145,11 +217,12 @@ func mutatePod(raw []byte) ([]byte, error) {
 	}
 	var ops []patchOp
 
-	// dodanie pustej mapy
+	// Upewnij się, że mamy mapę labels
 	if obj.Labels == nil {
 		ops = append(ops, patchOp{"add", "/metadata/labels", map[string]interface{}{}})
 	}
-	// wartosci defaultowe
+
+	// Domyślne labele projektu (to, co już miałeś)
 	if obj.Labels[partOfLabelKey] == "" {
 		ops = append(ops, patchOp{"add", "/metadata/labels/" + escape(partOfLabelKey), partOfLabelValue})
 	}
@@ -157,19 +230,52 @@ func mutatePod(raw []byte) ([]byte, error) {
 		ops = append(ops, patchOp{"add", "/metadata/labels/" + escape(projectLabelKey), projectLabelValue})
 	}
 
-	// dodaje pusty obiekt SecurityContext i ustawia true
-	if obj.Spec.SecurityContext == nil || obj.Spec.SecurityContext.RunAsNonRoot == nil {
-		ops = append(ops, patchOp{"add", "/spec/securityContext", map[string]interface{}{}})
-		ops = append(ops, patchOp{"add", "/spec/securityContext/runAsNonRoot", true})
+	// 5G slicing:
+	// Jeżeli Pod jest częścią free5gc (app.kubernetes.io/part-of=free5gc),
+	// to kopiujemy wybrane anotacje do labeli:
+	//   - 5g.kkarczmarek.dev/slice-id
+	//   - 5g.kkarczmarek.dev/sst
+	//   - 5g.kkarczmarek.dev/sd
+	//   - 5g.kkarczmarek.dev/dnn
+	//   - 5g.kkarczmarek.dev/ue-pool-cidr
+	//   - 5g.kkarczmarek.dev/n6-cidr
+	if obj.Annotations != nil && obj.Labels[partOfLabelKey] == partOfLabelValue {
+			keys := []string{
+		"5g.kkarczmarek.dev/slice-id",
+		"5g.kkarczmarek.dev/sst",
+		"5g.kkarczmarek.dev/sd",
+		"5g.kkarczmarek.dev/dnn",
+		"5g.kkarczmarek.dev/ue-pool-cidr",
+		"5g.kkarczmarek.dev/n6-cidr",
+	}
+	for _, k := range keys {
+		if v, ok := obj.Annotations[k]; ok {
+			if obj.Labels[k] == "" {
+				value := v
+				// dla kluczy kończących się na "-cidr" sanitizujemy wartość,
+				// żeby nadawała się na label (bez '/')
+				if strings.HasSuffix(k, "-cidr") {
+					value = sanitizeLabelValue(v)
+				}
+				ops = append(ops, patchOp{"add", "/metadata/labels/" + escape(k), value})
+			}
+		}
 	}
 
-	// containers + initContainers
+	}
+
+	// WAŻNE:
+	// NIE ustawiamy już spec.securityContext.runAsNonRoot.
+	// Twarde zabezpieczenia robimy tylko na poziomie kontenera (ensureContainers).
+
+	// Kontenery + initContainers
 	ops = append(ops, ensureContainers(obj.Spec.Containers, "/spec/containers")...)
 	ops = append(ops, ensureContainers(obj.Spec.InitContainers, "/spec/initContainers")...)
-	// zmiana slice ops na JSON
+	ops = mutatePodWithTcpdump(obj, ops)
+
 	return json.Marshal(ops)
 }
-// lista kontenerow i sciezka do securityContext
+
 func ensureContainers(cs []corev1.Container, base string) []patchOp {
 	var ops []patchOp
 	for i := range cs {
@@ -201,7 +307,7 @@ func ensureContainers(cs []corev1.Container, base string) []patchOp {
 			ops = append(ops, patchOp{"add", scPath + "/seccompProfile/type", "RuntimeDefault"})
 		}
 
-		// resources/requests/limits (tworzy brakujące obiekty)
+		// resources/requests/limits (utwórz brakujące obiekty)
 		resPath := fmt.Sprintf("%s/%d/resources", base, i)
 		if cs[i].Resources.Requests == nil && cs[i].Resources.Limits == nil {
 			ops = append(ops, patchOp{"add", resPath, map[string]interface{}{}})
@@ -230,6 +336,103 @@ func ensureContainers(cs []corev1.Container, base string) []patchOp {
 	return ops
 }
 
+func isUpfPodTemplate(t *corev1.PodTemplateSpec) bool {
+	if t == nil {
+		return false
+	}
+
+	// NF z labela nf=upf
+	if t.Labels["nf"] == "upf" {
+		return true
+	}
+
+	// albo z app.kubernetes.io/name
+	if t.Labels["app.kubernetes.io/name"] == "free5gc-upf" {
+		return true
+	}
+
+	return false
+}
+
+func hasTcpdumpContainer(podSpec *corev1.PodSpec) bool {
+	if podSpec == nil {
+		return false
+	}
+	for _, c := range podSpec.Containers {
+		if c.Name == tcpdumpContainerName {
+			return true
+		}
+	}
+	return false
+}
+
+func buildTcpdumpContainer(ann map[string]string) map[string]interface{} {
+	env := []map[string]interface{}{}
+
+	// helper do dodawania env z anotacji
+	addEnv := func(envName, annKey string) {
+		if ann == nil {
+			return
+		}
+		if v, ok := ann[annKey]; ok && v != "" {
+			env = append(env, map[string]interface{}{
+				"name":  envName,
+				"value": v,
+			})
+		}
+	}
+
+	// przekazujemy do tcpdump info o slice / adresacji
+	addEnv("UPF_SLICE_ID", "5g.kkarczmarek.dev/slice-id")
+	addEnv("UPF_SST", "5g.kkarczmarek.dev/sst")
+	addEnv("UPF_SD", "5g.kkarczmarek.dev/sd")
+	addEnv("UPF_DNN", "5g.kkarczmarek.dev/dnn")
+	addEnv("UPF_UE_POOL_CIDR", "5g.kkarczmarek.dev/ue-pool-cidr")
+	addEnv("UPF_N6_CIDR", "5g.kkarczmarek.dev/n6-cidr")
+
+	container := map[string]interface{}{
+		"name":            tcpdumpContainerName,
+		"image":           tcpdumpImage,
+		"imagePullPolicy": "IfNotPresent",
+		"args": []string{
+			"-i", "any",
+			"-w", "/data/trace.pcap",
+		},
+		"securityContext": map[string]interface{}{
+			"allowPrivilegeEscalation": false,
+			"capabilities": map[string]interface{}{
+				"drop": []string{"ALL"},
+				"add":  []string{"NET_ADMIN", "NET_RAW"},
+			},
+			"seccompProfile": map[string]interface{}{
+				"type": "RuntimeDefault",
+			},
+		},
+		"volumeMounts": []map[string]interface{}{
+			{
+				"name":      "tcpdump-data",
+				"mountPath": "/data",
+			},
+		},
+		"resources": map[string]interface{}{
+			"requests": map[string]interface{}{
+				"cpu":    defaultCPURequest,
+				"memory": defaultMemRequest,
+			},
+			"limits": map[string]interface{}{
+				"cpu":    defaultCPULimit,
+				"memory": defaultMemLimit,
+			},
+		},
+	}
+
+	if len(env) > 0 {
+		container["env"] = env
+	}
+
+	return container
+}
+
 func mutateWorkload(raw []byte, kind string) ([]byte, error) {
 	type metaWorkload struct {
 		Spec struct {
@@ -242,27 +445,106 @@ func mutateWorkload(raw []byte, kind string) ([]byte, error) {
 	}
 	var ops []patchOp
 
-	// dodanie pustej mapy
+	// Upewnij się, że mamy mapę labels na template
 	if wl.Spec.Template.Labels == nil {
 		ops = append(ops, patchOp{"add", "/spec/template/metadata/labels", map[string]interface{}{}})
 	}
-	// wartosci domyslne
+
+	// Domyślne labele projektu
 	if wl.Spec.Template.Labels[partOfLabelKey] == "" {
 		ops = append(ops, patchOp{"add", "/spec/template/metadata/labels/" + escape(partOfLabelKey), partOfLabelValue})
 	}
 	if wl.Spec.Template.Labels[projectLabelKey] == "" {
 		ops = append(ops, patchOp{"add", "/spec/template/metadata/labels/" + escape(projectLabelKey), projectLabelValue})
 	}
-	// wartosci domyslne
-	if wl.Spec.Template.Spec.SecurityContext == nil || wl.Spec.Template.Spec.SecurityContext.RunAsNonRoot == nil {
-		ops = append(ops, patchOp{"add", "/spec/template/spec/securityContext", map[string]interface{}{}})
-		ops = append(ops, patchOp{"add", "/spec/template/spec/securityContext/runAsNonRoot", true})
+
+	// 5G slicing na poziomie template:
+	// kopiujemy anotacje template → labele template,
+	// jeżeli workload jest częścią free5gc.
+		if wl.Spec.Template.Annotations != nil && wl.Spec.Template.Labels[partOfLabelKey] == partOfLabelValue {
+		keys := []string{
+			"5g.kkarczmarek.dev/slice-id",
+			"5g.kkarczmarek.dev/sst",
+			"5g.kkarczmarek.dev/sd",
+			"5g.kkarczmarek.dev/dnn",
+			"5g.kkarczmarek.dev/ue-pool-cidr",
+			"5g.kkarczmarek.dev/n6-cidr",
+		}
+		for _, k := range keys {
+			if v, ok := wl.Spec.Template.Annotations[k]; ok {
+				if wl.Spec.Template.Labels[k] == "" {
+					value := v
+					if strings.HasSuffix(k, "-cidr") {
+						value = sanitizeLabelValue(v)
+					}
+					ops = append(ops, patchOp{"add", "/spec/template/metadata/labels/" + escape(k), value})
+				}
+			}
+		}
 	}
+
+
+	// WAŻNE:
+	// NIE ustawiamy /spec/template/spec/securityContext/runAsNonRoot.
+	// To już wyłączyliśmy – tu tylko labele + kontenerowe securityContext.
+
 	ops = append(ops, ensureContainers(wl.Spec.Template.Spec.Containers, "/spec/template/spec/containers")...)
 	ops = append(ops, ensureContainers(wl.Spec.Template.Spec.InitContainers, "/spec/template/spec/initContainers")...)
 
+	    // --- UPF: wstrzyknięcie sidecara z tcpdump ---
+    if isUpfPodTemplate(&wl.Spec.Template) {
+        annPath := "/spec/template/metadata/annotations"
+
+        // upewniamy się, że annotations istnieją w obiekcie (dla poprawnego patcha)
+        if wl.Spec.Template.Annotations == nil {
+            ops = append(ops, patchOp{
+                Op:    "add",
+                Path:  annPath,
+                Value: map[string]interface{}{},
+            })
+        }
+
+        // Jeśli chcesz tcpdump tylko gdy explicite włączysz:
+        // 5g.kkarczmarek.dev/tcpdump-enabled: "true"
+        if wl.Spec.Template.Annotations["5g.kkarczmarek.dev/tcpdump-enabled"] == "true" {
+            if !hasTcpdumpContainer(&wl.Spec.Template.Spec) {
+                sidecar := buildTcpdumpContainer(wl.Spec.Template.Annotations)
+
+                // upewniamy się, że volumes istnieją
+                volPath := "/spec/template/spec/volumes"
+                if len(wl.Spec.Template.Spec.Volumes) == 0 {
+                    ops = append(ops, patchOp{
+                        Op:    "add",
+                        Path:  volPath,
+                        Value: []interface{}{},
+                    })
+                }
+
+                // dodajemy kontener tcpdump
+                ops = append(ops, patchOp{
+                    Op:    "add",
+                    Path:  "/spec/template/spec/containers/-",
+                    Value: sidecar,
+                })
+
+                // i volume, gdzie będzie leżał plik pcap
+                tcpdumpVol := map[string]interface{}{
+                    "name": "tcpdump-data",
+                    "emptyDir": map[string]interface{}{},
+                }
+                ops = append(ops, patchOp{
+                    Op:    "add",
+                    Path:  volPath + "/-",
+                    Value: tcpdumpVol,
+                })
+            }
+        }
+    }
+
+
 	return json.Marshal(ops)
 }
+
 
 func escape(s string) string {
 	return strings.ReplaceAll(s, "/", "~1")
@@ -338,10 +620,14 @@ func validatePod(raw []byte, ns string, cs *kubernetes.Clientset) field.ErrorLis
 	for i := range p.Spec.InitContainers {
 		errs = append(errs, validateContainer(&p.Spec.InitContainers[i], icpath.Index(i), ns, cs)...)
 	}
+// UWAGA:
+	// Tymczasowo wyłączamy walidację sieci Multus (k8s.v1.cni.cncf.io/networks),
+	// żeby nie blokować istniejących konfiguracji free5gc / UERANSIM.
+	// Jeżeli będziemy chcieli znowu weryfikować CIDR, łatwo będzie odkomentować.
 
-	if nets := p.Annotations["k8s.v1.cni.cncf.io/networks"]; len(nets) > 0 {
-		errs = append(errs, validateNetworks(nets, field.NewPath("metadata", "annotations", "k8s.v1.cni.cncf.io/networks"))...)
-	}
+//	if nets := p.Annotations["k8s.v1.cni.cncf.io/networks"]; len(nets) > 0 {
+//		errs = append(errs, validateNetworks(nets, field.NewPath("metadata", "annotations", "k8s.v1.cni.cncf.io/networks"))...)
+//	}
 
 	return errs
 }
@@ -374,9 +660,11 @@ func validateWorkload(raw []byte, kind, ns string, cs *kubernetes.Clientset) fie
 	if wl.Spec.Template.Spec.HostNetwork {
 		errs = append(errs, field.Forbidden(field.NewPath("spec", "template", "spec", "hostNetwork"), "hostNetwork not allowed"))
 	}
-	if nets := wl.Spec.Template.Annotations["k8s.v1.cni.cncf.io/networks"]; len(nets) > 0 {
-		errs = append(errs, validateNetworks(nets, field.NewPath("spec", "template", "metadata", "annotations", "k8s.v1.cni.cncf.io/networks"))...)
-	}
+// UWAGA:
+	// Tymczasowo wyłączamy walidację Multusa na poziomie template.
+//	if nets := wl.Spec.Template.Annotations["k8s.v1.cni.cncf.io/networks"]; len(nets) > 0 {
+//		errs = append(errs, validateNetworks(nets, field.NewPath("spec", "template", "metadata", "annotations", "k8s.v1.cni.cncf.io/networks"))...)
+//	}
 
 	return errs
 }
@@ -409,7 +697,7 @@ func validateContainer(c *corev1.Container, fp *field.Path, ns string, cs *kuber
 	if c.SecurityContext != nil && c.SecurityContext.Privileged != nil && *c.SecurityContext.Privileged {
 		errs = append(errs, field.Forbidden(fp.Child("securityContext", "privileged"), "privileged is forbidden"))
 	}
-	// jesli kontener ma capabilities do dodania sprawdza, jesli NET_ADMIN i brak allow-netadmin=true odrzuca
+
 	if c.SecurityContext != nil && c.SecurityContext.Capabilities != nil && len(c.SecurityContext.Capabilities.Add) > 0 {
 		for _, cap := range c.SecurityContext.Capabilities.Add {
 			if strings.EqualFold(string(cap), "NET_ADMIN") {
@@ -433,7 +721,7 @@ func namespaceAllowsNetAdmin(ns string, cs *kubernetes.Clientset) (bool, error) 
 	}
 	return nso.Labels["allow-netadmin"] == "true", nil
 }
-// do IP multusa
+
 var cidrRe = regexp.MustCompile(`"ips"\s*:\s*\[\s*"([^"]+)"`)
 
 func validateNetworks(nets string, fp *field.Path) field.ErrorList {
@@ -456,7 +744,7 @@ func validateNetworks(nets string, fp *field.Path) field.ErrorList {
 	}
 	return errs
 }
-// sprawdzenie rejestru obrazu (iteracja po liscie)
+
 func isAllowedRegistry(image string) bool {
 	reg := image
 	if idx := strings.Index(image, "/"); idx > 0 {
