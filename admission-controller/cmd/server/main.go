@@ -217,12 +217,11 @@ func mutatePod(raw []byte) ([]byte, error) {
 	}
 	var ops []patchOp
 
-	// Upewnij się, że mamy mapę labels
 	if obj.Labels == nil {
 		ops = append(ops, patchOp{"add", "/metadata/labels", map[string]interface{}{}})
 	}
 
-	// Domyślne labele projektu (to, co już miałeś)
+	// Domyślne labele projektu
 	if obj.Labels[partOfLabelKey] == "" {
 		ops = append(ops, patchOp{"add", "/metadata/labels/" + escape(partOfLabelKey), partOfLabelValue})
 	}
@@ -264,7 +263,6 @@ func mutatePod(raw []byte) ([]byte, error) {
 
 	}
 
-	// WAŻNE:
 	// NIE ustawiamy już spec.securityContext.runAsNonRoot.
 	// Twarde zabezpieczenia robimy tylko na poziomie kontenera (ensureContainers).
 
