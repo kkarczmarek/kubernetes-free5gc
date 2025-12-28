@@ -20,7 +20,7 @@ spec:
         runAsNonRoot: true
       containers:
         - name: webhook
-          image: localhost:32000/admission-webhook:0.1.1   # <- podmień na właściwy tag z GH Actions
+          image: localhost:32000/admission-webhook:0.2.0   # <- podmień na właściwy tag z GH Actions
           imagePullPolicy: IfNotPresent
           args: []
           ports:
