@@ -10,4 +10,8 @@ kind: Namespace
 metadata:
   name: free5gc
   labels:
-    pod-security.kubernetes.io/enforce: "restricted"
+    admission.kkarczmarek.dev/enabled: "true"
+    allow-netadmin: "true"
+    # UWAGA: BEZ PodSecurity na free5gc
+    # pod-security.kubernetes.io/enforce: restricted
+    # pod-security.kubernetes.io/enforce-version: latest

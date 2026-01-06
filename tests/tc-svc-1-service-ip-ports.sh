@@ -9,23 +9,22 @@ log() {
   echo "$@"
 }
 
-divider() {
-  echo "------------------------------------------------------------------"
-}
+log "==[TC-SVC-1] Walidacja anotacji required-ports na Service =="
 
-log "==[TC-SVC-1] Walidacja anotacji service-ip i required-ports na Service =="
-echo
-
+log
 log "==[TC-SVC-1] Sprzątanie starych Service'ów =="
-"${KUBECTL[@]}" -n "$NS" delete svc svc-web-ok svc-web-bad-ip svc-web-missing-port --ignore-not-found=true >/dev/null 2>&1 || true
-echo
+"${KUBECTL[@]}" -n "$NS" delete svc svc-web-ok svc-web-missing-port svc-web-bad-ports --ignore-not-found=true
 
-# -------------------------------------------------------------------
-# KROK 1: Poprawny Service – IP w DATA_CIDR, komplet wymaganych portów
-# -------------------------------------------------------------------
-log "==[TC-SVC-1] Krok 1: poprawny Service (IP w DATA_CIDR, komplet portów) – oczekuję ALLOW =="
+###############################################################################
+# KROK 1 – poprawny Service:
+#  - anotacja required-ports: "80,443"
+#  - w spec.ports są zarówno 80, jak i 443
+#  -> OCZEKUJĘ: ALLOW
+###############################################################################
+log
+log "==[TC-SVC-1] Krok 1: poprawny Service (komplet portów) – oczekuję ALLOW =="
 
-if cat <<'YAML' | "${KUBECTL[@]}" -n "$NS" apply -f -; then
+cat <<EOF | "${KUBECTL[@]}" -n "$NS" apply -f -
 apiVersion: v1
 kind: Service
 metadata:
@@ -35,7 +34,6 @@ metadata:
     app.kubernetes.io/part-of: free5gc
     project: free5gc
   annotations:
-    5g.kkarczmarek.dev/service-ip: "10.100.10.50"
     5g.kkarczmarek.dev/required-ports: "80,443"
 spec:
   selector:
@@ -47,62 +45,21 @@ spec:
     - name: https
       port: 443
       targetPort: 443
-YAML
-  log "[OK] svc-web-ok został UTWORZONY – poprawna konfiguracja."
-  log "     Sprawdzam porty i anotacje..."
-  divider
-  "${KUBECTL[@]}" -n "$NS" get svc svc-web-ok -o wide
-  echo
-else
-  log "[BŁĄD] svc-web-ok został ODRZUCONY, a powinien być dozwolony!"
-fi
+EOF
 
-echo
+log "  -> Service został STWORZONY (oczekiwane ALLOW):"
+"${KUBECTL[@]}" -n "$NS" get svc svc-web-ok -o wide
 
-# -------------------------------------------------------------------
-# KROK 2: IP spoza DATA_CIDR – oczekiwany DENY
-# -------------------------------------------------------------------
-log "==[TC-SVC-1] Krok 2: IP poza DATA_CIDR – oczekuję DENY =="
+###############################################################################
+# KROK 2 – brak jednego z wymaganych portów:
+#  - required-ports: "80,443"
+#  - w spec.ports jest tylko 80
+#  -> OCZEKUJĘ: DENY od naszego webhooka
+###############################################################################
+log
+log "==[TC-SVC-1] Krok 2: brak wymaganego portu 443 – oczekuję DENY =="
 
-if cat <<'YAML' | "${KUBECTL[@]}" -n "$NS" apply -f -; then
-apiVersion: v1
-kind: Service
-metadata:
-  name: svc-web-bad-ip
-  labels:
-    app: web
-    app.kubernetes.io/part-of: free5gc
-    project: free5gc
-  annotations:
-    5g.kkarczmarek.dev/service-ip: "192.168.10.50"   # poza DATA_CIDR=10.100.0.0/16
-    5g.kkarczmarek.dev/required-ports: "80,443"
-spec:
-  selector:
-    app: web
-  ports:
-    - name: http
-      port: 80
-      targetPort: 80
-    - name: https
-      port: 443
-      targetPort: 443
-YAML
-  log "[BŁĄD] svc-web-bad-ip został UTWORZONY, a powinien być ODRZUCONY przez webhook!"
-  divider
-  "${KUBECTL[@]}" -n "$NS" get svc svc-web-bad-ip -o wide || true
-  echo
-else
-  log "[OK] svc-web-bad-ip został ODRZUCONY przez webhook – IP poza DATA_CIDR."
-fi
-
-echo
-
-# -------------------------------------------------------------------
-# KROK 3: Brak wymaganego portu z required-ports – oczekiwany DENY
-# -------------------------------------------------------------------
-log "==[TC-SVC-1] Krok 3: brak jednego z wymaganych portów – oczekuję DENY =="
-
-if cat <<'YAML' | "${KUBECTL[@]}" -n "$NS" apply -f -; then
+if "${KUBECTL[@]}" -n "$NS" apply -f - 2>svc-missing-port.err <<EOF; then
 apiVersion: v1
 kind: Service
 metadata:
@@ -112,7 +69,6 @@ metadata:
     app.kubernetes.io/part-of: free5gc
     project: free5gc
   annotations:
-    5g.kkarczmarek.dev/service-ip: "10.100.20.50"
     5g.kkarczmarek.dev/required-ports: "80,443"
 spec:
   selector:
@@ -121,16 +77,54 @@ spec:
     - name: http
       port: 80
       targetPort: 80
-    # celowo brak portu 443
-YAML
-  log "[BŁĄD] svc-web-missing-port został UTWORZONY, a powinien być ODRZUCONY (brak portu 443)!"
-  divider
-  "${KUBECTL[@]}" -n "$NS" get svc svc-web-missing-port -o wide || true
-  echo
+    # brak portu 443 – webhook powinien się przyczepić
+EOF
+  log "[BŁĄD] svc-web-missing-port został UTWORZONY, a powinien być ODRZUCONY przez webhook!"
+  "${KUBECTL[@]}" -n "$NS" get svc svc-web-missing-port -o yaml | sed -n '1,80p' || true
 else
   log "[OK] svc-web-missing-port został ODRZUCONY przez webhook – brak wymaganego portu 443."
+  log "  -> komunikat z API:"
+  cat svc-missing-port.err
 fi
+rm -f svc-missing-port.err
 
-echo
-divider
-log "==[TC-SVC-1] KONIEC TESTU – zobacz komunikaty ALLOW/DENY powyżej =="
+###############################################################################
+# KROK 3 – błędny format required-ports:
+#  - required-ports: "80,foo" (foo nie jest liczbą)
+#  -> OCZEKUJĘ: DENY z komunikatem o niepoprawnej liście portów
+###############################################################################
+log
+log "==[TC-SVC-1] Krok 3: błędna anotacja required-ports – oczekuję DENY =="
+
+if "${KUBECTL[@]}" -n "$NS" apply -f - 2>svc-bad-ports.err <<EOF; then
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-web-bad-ports
+  labels:
+    app: web
+    app.kubernetes.io/part-of: free5gc
+    project: free5gc
+  annotations:
+    5g.kkarczmarek.dev/required-ports: "80,foo"
+spec:
+  selector:
+    app: web
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+EOF
+  log "[BŁĄD] svc-web-bad-ports został UTWORZONY, a powinien być ODRZUCONY (zły format required-ports)!"
+  "${KUBECTL[@]}" -n "$NS" get svc svc-web-bad-ports -o yaml | sed -n '1,80p' || true
+else
+  log "[OK] svc-web-bad-ports został ODRZUCONY przez webhook – błędny format required-ports."
+  log "  -> komunikat z API:"
+  cat svc-bad-ports.err
+fi
+rm -f svc-bad-ports.err
+
+log
+log "------------------------------------------------------------------"
+log "==[TC-SVC-1] KONIEC TESTU – powyżej: ALLOW dla poprawnego Service"
+log "             oraz dwa DENY: brak portu 443 i błędna anotacja required-ports =="

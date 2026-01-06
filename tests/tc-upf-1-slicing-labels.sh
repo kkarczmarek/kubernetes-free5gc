@@ -1,47 +1,88 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# zawsze microk8s kubectl
+KUBECTL=(microk8s kubectl)
+
 NS="free5gc"
-UPF_DEPLOY="free5gc-free5gc-upf-upf"
-KCTL="microk8s kubectl -n ${NS}"
+DEPLOY="upf-slicing-demo"
+LABEL_SELECTOR="app=upf-slicing-demo"
 
-echo "==[TC-UPF-1] Ustawianie anotacji slicing + CIDR na Deployment UPF=="
+log() {
+  echo "$@"
+}
 
-# 1) upewniamy się, że jest jedna replika UPF
-$KCTL scale deploy "${UPF_DEPLOY}" --replicas=1
+log "==[TC-UPF-1] Slicing + DNN na anotacjach UPF i etykietach Poda =="
 
-# 2) patch z anotacjami slicing + adresacja
-$KCTL patch deploy "${UPF_DEPLOY}" \
-  -p '{
-    "spec": {
-      "template": {
-        "metadata": {
-          "annotations": {
-            "5g.kkarczmarek.dev/slice-id": "1",
-            "5g.kkarczmarek.dev/sst": "1",
-            "5g.kkarczmarek.dev/sd": "010203",
-            "5g.kkarczmarek.dev/dnn": "internet",
-            "5g.kkarczmarek.dev/ue-pool-cidr": "10.60.0.0/24",
-            "5g.kkarczmarek.dev/n6-cidr": "10.100.100.0/24",
-            "5g.kkarczmarek.dev/tcpdump-enabled": "true"
-          }
-        }
-      }
-    }
-  }'
+log
+log "==[TC-UPF-1] Sprzątanie starego Deploymentu demo =="
+"${KUBECTL[@]}" -n "$NS" delete deploy "$DEPLOY" --ignore-not-found=true
 
-echo
-echo "==[TC-UPF-1] Usuwam aktualne Pody UPF, żeby Deployment utworzył nowe z anotacjami=="
-$KCTL delete pod -l nf=upf --ignore-not-found
+log
+log "==[TC-UPF-1] Krok 1: Tworzę demo-UPF z anotacjami 5g.* (BEZ CIDRów) =="
 
-echo
-echo "==[TC-UPF-1] Czekam na pełny rollout Deploymentu UPF=="
-$KCTL rollout status deploy "${UPF_DEPLOY}" --timeout=300s
+cat <<EODEP | "${KUBECTL[@]}" apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${DEPLOY}
+  namespace: ${NS}
+  labels:
+    app: upf-slicing-demo
+    app.kubernetes.io/part-of: free5gc
+    project: free5gc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: upf-slicing-demo
+  template:
+    metadata:
+      labels:
+        app: upf-slicing-demo
+        app.kubernetes.io/part-of: free5gc
+        project: free5gc
+        nf: upf
+      annotations:
+        5g.kkarczmarek.dev/slice-id: "1"
+        5g.kkarczmarek.dev/sst: "1"
+        5g.kkarczmarek.dev/sd: "010203"
+        5g.kkarczmarek.dev/dnn: "internet"
+    spec:
+      containers:
+      - name: main
+        image: docker.io/library/busybox:1.36
+        command: ["sh","-c","sleep 3600"]
+EODEP
 
-echo
-echo "==[TC-UPF-1] Aktualne Pody UPF z labelami slicing/adresacja=="
-$KCTL get pods -l nf=upf \
-  -o wide \
-  -L 5g.kkarczmarek.dev/slice-id,5g.kkarczmarek.dev/sst,5g.kkarczmarek.dev/sd,\
-5g.kkarczmarek.dev/dnn,5g.kkarczmarek.dev/ue-pool-cidr,5g.kkarczmarek.dev/n6-cidr
+log
+log "==[TC-UPF-1] Krok 2: Czekam na rollout i wybieram Poda =="
 
+"${KUBECTL[@]}" -n "$NS" rollout status deploy/"$DEPLOY"
+
+POD=$("${KUBECTL[@]}" -n "$NS" get pods -l "$LABEL_SELECTOR" \
+  -o jsonpath='{.items[0].metadata.name}')
+
+log "  -> Pod UPF demo: ${POD}"
+
+log
+log "==[TC-UPF-1] Anotacje 5g.* na Podzie =="
+ANN=$("${KUBECTL[@]}" -n "$NS" get pod "$POD" -o jsonpath='{.metadata.annotations}')
+if echo "$ANN" | grep -q '5g.kkarczmarek.dev'; then
+  echo "$ANN" | tr ' ' '\n' | grep '5g.kkarczmarek.dev' | sed 's/^/  /'
+else
+  echo "  (brak anotacji 5g.*)"
+fi
+
+log
+log "==[TC-UPF-1] Labele 5g.* na Podzie (zmutowane przez webhook) =="
+LBL=$("${KUBECTL[@]}" -n "$NS" get pod "$POD" -o jsonpath='{.metadata.labels}')
+if echo "$LBL" | grep -q '5g.kkarczmarek.dev'; then
+  echo "$LBL" | tr ' ' '\n' | grep '5g.kkarczmarek.dev' | sed 's/^/  /'
+else
+  echo "  (brak labeli 5g.*)"
+fi
+
+log
+log "------------------------------------------------------------------"
+log "==[TC-UPF-1] KONIEC TESTU – slicing/DNN są w anotacjach i (opcjonalnie) labelach Poda nf=upf =="

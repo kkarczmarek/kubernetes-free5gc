@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: t-deny-privileged
-  namespace: playground
+  namespace: free5gc
 spec:
   containers:
     - name: c

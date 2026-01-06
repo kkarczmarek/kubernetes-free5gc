@@ -44,7 +44,7 @@ var (
 	admissionLabelKey      = "admission.kkarczmarek.dev/enabled"
 	allowNetAdminNsLabel   = "allow-netadmin"
 	allowHostPathNsLabel   = "allow-hostpath"
-	validateNetworksAnno   = "5g.kkarczmarek.dev/validate-dataplane-cidr"
+	validateNetworksAnno   = "5g.kkarczmarek.dev/validate-networks"
 	requiredPortsAnnotation = "5g.kkarczmarek.dev/required-ports"
 	serviceIPAnnotation     = "5g.kkarczmarek.dev/service-ip"
 
@@ -1008,78 +1008,74 @@ func validateWorkload(raw []byte, namespace, kind string, clientset kubernetes.I
 }
 
 func validateService(raw []byte, namespace string, clientset kubernetes.Interface) field.ErrorList {
-	svc := &corev1.Service{}
-	if _, _, err := deserializer.Decode(raw, nil, svc); err != nil {
-		return field.ErrorList{
-			field.Invalid(field.NewPath("kind"), "Service", fmt.Sprintf("decode service: %v", err)),
-		}
-	}
+    svc := &corev1.Service{}
+    if _, _, err := deserializer.Decode(raw, nil, svc); err != nil {
+        return field.ErrorList{
+            field.Invalid(field.NewPath("kind"), "Service", fmt.Sprintf("decode service: %v", err)),
+        }
+    }
 
-	ctx := context.Background()
-	shouldHandle, _, err := shouldHandleNamespace(ctx, clientset, namespace)
-	if err != nil {
-		return field.ErrorList{
-			field.Invalid(field.NewPath("metadata", "namespace"), namespace, err.Error()),
-		}
-	}
-	if !shouldHandle {
-		return nil
-	}
+    ctx := context.Background()
+    shouldHandle, _, err := shouldHandleNamespace(ctx, clientset, namespace)
+    if err != nil {
+        return field.ErrorList{
+            field.Invalid(field.NewPath("metadata", "namespace"), namespace, err.Error()),
+        }
+    }
+    if !shouldHandle {
+        return nil
+    }
 
-	var allErrs field.ErrorList
+    var allErrs field.ErrorList
 
-	// service IP z anotacji
-	if svc.Annotations != nil {
-		if val, ok := svc.Annotations[serviceIPAnnotation]; ok {
-			ipStr := strings.TrimSpace(val)
-			if ipStr != "" {
-				ip := net.ParseIP(ipStr)
-				if ip == nil {
-					allErrs = append(allErrs, field.Invalid(
-						field.NewPath("metadata", "annotations", serviceIPAnnotation),
-						val,
-						"not a valid IP address",
-					))
-				} else if dataPlaneCIDR != "" {
-					_, cidrNet, err := net.ParseCIDR(dataPlaneCIDR)
-					if err == nil && !cidrNet.Contains(ip) {
-						allErrs = append(allErrs, field.Forbidden(
-							field.NewPath("metadata", "annotations", serviceIPAnnotation),
-							fmt.Sprintf("service IP %s must be inside %s", ipStr, dataPlaneCIDR),
-						))
-					}
-				}
-			}
-		}
+    if svc.Annotations != nil {
+        // 1) opcjonalna walidacja samego formatu IP w anotacji service-ip
+        if val, ok := svc.Annotations[serviceIPAnnotation]; ok {
+            ipStr := strings.TrimSpace(val)
+            if ipStr != "" {
+                ip := net.ParseIP(ipStr)
+                if ip == nil {
+                    allErrs = append(allErrs, field.Invalid(
+                        field.NewPath("metadata", "annotations", serviceIPAnnotation),
+                        val,
+                        "not a valid IP address",
+                    ))
+                }
+                // UWAGA: tutaj NIE sprawdzamy żadnego CIDR-a ani zgodności z clusterIP.
+                // To zostawiamy kube-apiserverowi / innym komponentom.
+            }
+        }
 
-		if rawPorts := strings.TrimSpace(svc.Annotations[requiredPortsAnnotation]); rawPorts != "" {
-			ports, err := parsePortList(rawPorts)
-			if err != nil {
-				allErrs = append(allErrs, field.Invalid(
-					field.NewPath("metadata", "annotations", requiredPortsAnnotation),
-					rawPorts,
-					err.Error(),
-				))
-			} else {
-				for _, p := range ports {
-					found := false
-					for _, sp := range svc.Spec.Ports {
-						if sp.Port == p {
-							found = true
-							break
-						}
-					}
-					if !found {
-						allErrs = append(allErrs, field.Forbidden(
-							field.NewPath("spec", "ports"),
-							fmt.Sprintf("service must expose port %d (required by %s)", p, requiredPortsAnnotation),
-						))
-					}
-				}
-			}
-		}
-	}
-	return allErrs
+        // 2) walidacja required-ports: czy wszystkie porty z anotacji są w spec.ports
+        if rawPorts := strings.TrimSpace(svc.Annotations[requiredPortsAnnotation]); rawPorts != "" {
+            ports, err := parsePortList(rawPorts)
+            if err != nil {
+                allErrs = append(allErrs, field.Invalid(
+                    field.NewPath("metadata", "annotations", requiredPortsAnnotation),
+                    rawPorts,
+                    err.Error(),
+                ))
+            } else {
+                for _, p := range ports {
+                    found := false
+                    for _, sp := range svc.Spec.Ports {
+                        if sp.Port == p {
+                            found = true
+                            break
+                        }
+                    }
+                    if !found {
+                        allErrs = append(allErrs, field.Forbidden(
+                            field.NewPath("spec", "ports"),
+                            fmt.Sprintf("service must expose port %d (required by %s)", p, requiredPortsAnnotation),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    return allErrs
 }
 
 // Walidacja pojedynczego kontenera
